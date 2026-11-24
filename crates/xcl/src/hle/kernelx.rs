@@ -828,7 +828,7 @@ pub struct TitleMemoryStatusT {
     pub title_page_table_used: u64,
 }
 
-fn process_private_bytes() -> u64 {
+pub(crate) fn process_private_bytes() -> u64 {
     use windows_sys::Win32::System::ProcessStatus::{K32GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS_EX};
     unsafe {
         let mut c: PROCESS_MEMORY_COUNTERS_EX = std::mem::zeroed();

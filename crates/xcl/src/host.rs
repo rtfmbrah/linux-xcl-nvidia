@@ -60,13 +60,7 @@ pub fn host_main(boot_path: &Path) -> i32 {
                     d[0], d[1], d[2], d[3], d[4], d[5], d[6], d[7], d[8], d[9], d[10]
                 );
                 // where the memory is: the process's commit, video memory, and XCL's parts of it
-                let private = unsafe {
-                    use windows_sys::Win32::System::ProcessStatus::{K32GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS_EX};
-                    let mut c: PROCESS_MEMORY_COUNTERS_EX = std::mem::zeroed();
-                    c.cb = std::mem::size_of_val(&c) as u32;
-                    K32GetProcessMemoryInfo(windows_sys::Win32::System::Threading::GetCurrentProcess(), &mut c as *mut _ as *mut _, c.cb);
-                    c.PrivateUsage
-                };
+                let private = crate::hle::kernelx::process_private_bytes();
                 let (local, non_local) = crate::hle::d3d12x::real::video_memory().unwrap_or((0, 0));
                 let (arenas, arenas_made) = crate::hle::d3d12x::vram::arena_bytes();
                 let (pools, pools_mapped) = crate::hle::d3d12x::sparse::pool_bytes();
@@ -74,7 +68,7 @@ pub fn host_main(boot_path: &Path) -> i32 {
                 let mb = |b: u64| b >> 20;
                 crate::xlog_info!(
                     "memory: {} MB committed by the process; video memory {} MB local, {} MB non-local; target pages {} MB (pools {} MB); arenas {} MB in use, {} MB made; sparse pools {} MB ({} MB mapped)",
-                    mb(private as u64),
+                    mb(private),
                     mb(local),
                     mb(non_local),
                     mb(pages as u64),

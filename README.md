@@ -297,6 +297,8 @@ Fill the reusable DXIL cache ahead of a run with the read-only package wrapper. 
 - `XCL_DSTORAGE_PARALLEL_DECOMPRESS=1` enables parallel CPU decompression for file-backed zlib
   requests with virtual destinations. Defaults: four workers and a shared 32 MiB staging budget
   (`XCL_DSTORAGE_WORKERS`, `XCL_DSTORAGE_MEMORY_BUDGET_MIB`). Requests retire in queue order.
+- `XCL_ACTIVITY=1` logs rendering, streaming and memory activity every two seconds. Under Wine,
+  the process commit figure is Wine's estimate from anonymous resident memory and swap.
 - Every run writes `report.json` (called stubs, unknown D3D12.X slots and interfaces, XGameRuntime
   classes asked for, shader statistics, audio formats, crash).
   `d3d12.presents` counts presentations, not visible content. With `XCL_FRAME_DUMP=N` (`N > 1`),
