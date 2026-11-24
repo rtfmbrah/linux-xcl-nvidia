@@ -560,6 +560,7 @@ dependencies = [
  "serde_json",
  "toml",
  "windows",
+ "windows-core",
  "windows-sys 0.61.2",
 ]
 

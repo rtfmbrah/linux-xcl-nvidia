@@ -12,15 +12,17 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::ffi::c_void;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
 
 use windows::core::{Interface, GUID, HRESULT, PCWSTR};
 use windows::Win32::Graphics::Direct3D::Dxc::{
     CLSID_DxcCompiler, CLSID_DxcLinker, CLSID_DxcUtils, DxcBuffer, IDxcBlob, IDxcBlobEncoding, IDxcCompiler3, IDxcLinker, IDxcResult, IDxcUtils, DXC_CP, DXC_CP_UTF8,
 };
+use windows::Win32::System::Com::{IMalloc, IMalloc_Impl};
 
 type CreateInstance = unsafe extern "system" fn(*const GUID, *const GUID, *mut *mut c_void) -> HRESULT;
+type CreateInstance2 = unsafe extern "system" fn(*mut c_void, *const GUID, *const GUID, *mut *mut c_void) -> HRESULT;
 
 /// A dotted version, `10.0.26100.0` or `1.9.2602.17`, as four numbers (missing ones are 0).
 fn parse_version(s: &str) -> Option<[u32; 4]> {
@@ -193,7 +195,7 @@ unsafe fn library(create: CreateInstance, class: &GUID, file: &Path) -> Library 
     lib
 }
 
-static LIB: OnceLock<Result<(PathBuf, usize), String>> = OnceLock::new();
+static LIB: OnceLock<Result<(PathBuf, usize, Option<usize>), String>> = OnceLock::new();
 static TOOLCHAIN: OnceLock<Toolchain> = OnceLock::new();
 
 /// The DXC in use; empty while none is loaded (asking does not load it).
@@ -307,10 +309,10 @@ mod version_tests {
 
 /// Folder with dxcompiler.dll (+ dxil.dll) that will be used.
 pub fn location() -> Result<&'static Path, String> {
-    load().map(|(p, _)| p.as_path())
+    load().map(|(p, ..)| p.as_path())
 }
 
-fn load() -> Result<&'static (PathBuf, usize), String> {
+fn load() -> Result<&'static (PathBuf, usize, Option<usize>), String> {
     LIB.get_or_init(|| {
         use windows_sys::Win32::System::LibraryLoader::{GetProcAddress, LoadLibraryW};
         for dir in candidates() {
@@ -326,6 +328,7 @@ fn load() -> Result<&'static (PathBuf, usize), String> {
                     continue;
                 }
                 if let Some(f) = GetProcAddress(h, b"DxcCreateInstance\0".as_ptr()) {
+                    let f2 = GetProcAddress(h, b"DxcCreateInstance2\0".as_ptr()).map(|f| f as usize);
                     let mut t = Toolchain { dir: dir.display().to_string(), ..Default::default() };
                     t.dxcompiler = library(std::mem::transmute::<usize, CreateInstance>(f as usize), &CLSID_DxcCompiler, &dxc);
                     if let Some(g) = if signer.is_null() { None } else { GetProcAddress(signer, b"DxcCreateInstance\0".as_ptr()) } {
@@ -337,7 +340,7 @@ fn load() -> Result<&'static (PathBuf, usize), String> {
                         crate::xlog_warn!("DXC {} is older than {}.{}: {OUTDATED_COST}; {OUTDATED_FIX}", t.dxcompiler, RECOMMENDED.0, RECOMMENDED.1);
                     }
                     let _ = TOOLCHAIN.set(t);
-                    return Ok((dir, f as usize));
+                    return Ok((dir, f as usize, f2));
                 }
             }
         }
@@ -349,12 +352,91 @@ fn load() -> Result<&'static (PathBuf, usize), String> {
 
 /// The PC compiler's DxcCreateInstance (for titles that use the console's `dxcompiler_xs.dll`).
 pub fn create_instance() -> Option<usize> {
-    load().ok().map(|&(_, f)| f)
+    load().ok().map(|&(_, f, _)| f)
 }
 
 fn create_fn() -> Result<CreateInstance, String> {
-    let &(_, f) = load()?;
+    let &(_, f, _) = load()?;
     Ok(unsafe { std::mem::transmute::<usize, CreateInstance>(f) })
+}
+
+fn create2_fn() -> Result<Option<CreateInstance2>, String> {
+    let &(_, _, f) = load()?;
+    Ok(f.map(|f| unsafe { std::mem::transmute::<usize, CreateInstance2>(f) }))
+}
+
+/// A serialized process heap for one DXC compiler. DXC allocates heavily through `IMalloc`;
+/// one private heap per compiler keeps its workers off the process heap's global lock.
+#[windows::core::implement(IMalloc)]
+struct DxcMalloc {
+    heap: windows_sys::Win32::Foundation::HANDLE,
+}
+
+// DXC may allocate and release through the interface on its own internal threads. The heap is
+// serialized and the handle never changes, so sharing the COM object is safe.
+unsafe impl Send for DxcMalloc {}
+unsafe impl Sync for DxcMalloc {}
+
+impl DxcMalloc {
+    fn new() -> Result<Self, String> {
+        let heap = unsafe { windows_sys::Win32::System::Memory::HeapCreate(0, 0, 0) };
+        if heap.is_null() {
+            Err(format!("HeapCreate for DXC: {}", std::io::Error::last_os_error()))
+        } else {
+            Ok(Self { heap })
+        }
+    }
+}
+
+impl IMalloc_Impl for DxcMalloc_Impl {
+    fn Alloc(&self, cb: usize) -> *mut c_void {
+        unsafe { windows_sys::Win32::System::Memory::HeapAlloc(self.heap, 0, cb) }
+    }
+
+    fn Realloc(&self, pv: *const c_void, cb: usize) -> *mut c_void {
+        unsafe {
+            if pv.is_null() {
+                return windows_sys::Win32::System::Memory::HeapAlloc(self.heap, 0, cb);
+            }
+            if cb == 0 {
+                let _ = windows_sys::Win32::System::Memory::HeapFree(self.heap, 0, pv);
+                return std::ptr::null_mut();
+            }
+            windows_sys::Win32::System::Memory::HeapReAlloc(self.heap, 0, pv, cb)
+        }
+    }
+
+    fn Free(&self, pv: *const c_void) {
+        if !pv.is_null() {
+            let _ = unsafe { windows_sys::Win32::System::Memory::HeapFree(self.heap, 0, pv) };
+        }
+    }
+
+    fn GetSize(&self, pv: *const c_void) -> usize {
+        if pv.is_null() {
+            usize::MAX
+        } else {
+            unsafe { windows_sys::Win32::System::Memory::HeapSize(self.heap, 0, pv) }
+        }
+    }
+
+    fn DidAlloc(&self, pv: *const c_void) -> i32 {
+        if pv.is_null() {
+            -1
+        } else {
+            (unsafe { windows_sys::Win32::System::Memory::HeapValidate(self.heap, 0, pv) } != 0) as i32
+        }
+    }
+
+    fn HeapMinimize(&self) {
+        unsafe { windows_sys::Win32::System::Memory::HeapCompact(self.heap, 0) };
+    }
+}
+
+impl Drop for DxcMalloc {
+    fn drop(&mut self) {
+        let _ = unsafe { windows_sys::Win32::System::Memory::HeapDestroy(self.heap) };
+    }
 }
 
 thread_local! {
@@ -366,9 +448,30 @@ fn compiler() -> Result<IDxcCompiler3, String> {
         if let Some(x) = c.borrow().as_ref() {
             return Ok(x.clone());
         }
-        let create = create_fn()?;
         let mut p = std::ptr::null_mut();
-        let hr = unsafe { create(&CLSID_DxcCompiler, &IDxcCompiler3::IID, &mut p) };
+        let mut hr = HRESULT(crate::util::E_NOTIMPL);
+        if let Some(create2) = create2_fn()? {
+            let malloc: IMalloc = DxcMalloc::new()?.into();
+            hr = unsafe { create2(malloc.as_raw(), &CLSID_DxcCompiler, &IDxcCompiler3::IID, &mut p) };
+            if hr.is_ok() && !p.is_null() {
+                static LOGGED: AtomicBool = AtomicBool::new(false);
+                if !LOGGED.swap(true, Ordering::Relaxed) {
+                    crate::xlog_info!("DXC: compiler workers use private heaps");
+                }
+            } else if hr.0 == crate::util::E_INVALIDARG {
+                static WARNED: AtomicBool = AtomicBool::new(false);
+                if !WARNED.swap(true, Ordering::Relaxed) {
+                    crate::xlog_warn!("DXC: DxcCreateInstance2 rejected a private allocator; using DxcCreateInstance");
+                }
+                p = std::ptr::null_mut();
+            } else {
+                return Err(format!("DxcCreateInstance2: {hr:?}"));
+            }
+        }
+        if p.is_null() {
+            let create = create_fn()?;
+            hr = unsafe { create(&CLSID_DxcCompiler, &IDxcCompiler3::IID, &mut p) };
+        }
         if hr.is_err() || p.is_null() {
             return Err(format!("DxcCreateInstance: {hr:?}"));
         }
@@ -376,6 +479,73 @@ fn compiler() -> Result<IDxcCompiler3, String> {
         *c.borrow_mut() = Some(x.clone());
         Ok(x)
     })
+}
+
+#[cfg(test)]
+mod private_heap_tests {
+    use super::*;
+
+    #[test]
+    fn private_dxc_allocator_obeys_imalloc_contract() {
+        let malloc: IMalloc = DxcMalloc::new().unwrap().into();
+        unsafe {
+            let zero = malloc.Alloc(0);
+            assert!(!zero.is_null());
+            assert_eq!(malloc.DidAlloc(Some(zero)), 1);
+            malloc.Free(Some(zero));
+
+            let p = malloc.Alloc(16);
+            assert!(!p.is_null());
+            for i in 0..16 {
+                p.cast::<u8>().add(i).write(i as u8);
+            }
+            assert!(malloc.GetSize(Some(p)) >= 16);
+            assert_eq!(malloc.DidAlloc(Some(p)), 1);
+
+            let grown = malloc.Realloc(Some(p), 64);
+            assert!(!grown.is_null());
+            for i in 0..16 {
+                assert_eq!(grown.cast::<u8>().add(i).read(), i as u8);
+            }
+            assert!(malloc.Realloc(Some(grown), 0).is_null());
+
+            let from_null = malloc.Realloc(None, 8);
+            assert!(!from_null.is_null());
+            malloc.Free(Some(from_null));
+            malloc.Free(None);
+        }
+    }
+
+    #[test]
+    fn private_allocators_compile_on_two_threads() {
+        if location().is_err() {
+            crate::gpu::recomp::runner::skip_test("no DXC");
+            return;
+        }
+        if create2_fn().ok().flatten().is_none() {
+            crate::gpu::recomp::runner::skip_test("DXC has no DxcCreateInstance2");
+            return;
+        }
+        let start = Arc::new(std::sync::Barrier::new(3));
+        std::thread::scope(|scope| {
+            let threads: Vec<_> = [1, 2]
+                .into_iter()
+                .map(|x| {
+                    let start = start.clone();
+                    scope.spawn(move || {
+                        start.wait();
+                        let src = format!("[numthreads({x}, 1, 1)] void main() {{}}");
+                        compile_here(&src, "main", "cs_6_6", &[])
+                    })
+                })
+                .collect();
+            start.wait();
+            for thread in threads {
+                let dxil = thread.join().unwrap().unwrap();
+                assert!(valid_dxil_container(&dxil));
+            }
+        });
+    }
 }
 
 /// Stack of the thread DXC runs on: its LLVM passes recurse along long dependency chains of
