@@ -828,15 +828,22 @@ pub struct TitleMemoryStatusT {
     pub title_page_table_used: u64,
 }
 
-pub(crate) fn process_private_bytes() -> u64 {
+fn process_private_bytes() -> u64 {
+    // Keep the guest title-memory APIs' existing PagefileUsage fallback.
+    process_commit_bytes(true)
+}
+
+fn commit_bytes(private: usize, pagefile: usize, allow_pagefile: bool) -> u64 {
+    if private == 0 && allow_pagefile { pagefile as u64 } else { private as u64 }
+}
+
+pub(crate) fn process_commit_bytes(allow_pagefile: bool) -> u64 {
     use windows_sys::Win32::System::ProcessStatus::{K32GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS_EX};
     unsafe {
         let mut c: PROCESS_MEMORY_COUNTERS_EX = std::mem::zeroed();
         c.cb = std::mem::size_of::<PROCESS_MEMORY_COUNTERS_EX>() as u32;
         if K32GetProcessMemoryInfo(thr::GetCurrentProcess(), &mut c as *mut _ as *mut _, c.cb) != 0 {
-            // Wine fills the fields before PrivateUsage only; PagefileUsage is the same number
-            // on Windows (the commit charge)
-            if c.PrivateUsage != 0 { c.PrivateUsage as u64 } else { c.PagefileUsage as u64 }
+            commit_bytes(c.PrivateUsage, c.PagefileUsage, allow_pagefile)
         } else {
             0
         }
@@ -2867,6 +2874,15 @@ mod tests {
                 mem::VirtualFree(r as *mut c_void, 0, mem::MEM_RELEASE);
             }
         }
+    }
+
+    #[test]
+    fn activity_commit_uses_pagefile_only_when_allowed() {
+        assert_eq!(commit_bytes(123, 456, false), 123);
+        assert_eq!(commit_bytes(123, 456, true), 123);
+        assert_eq!(commit_bytes(0, 456, true), 456);
+        // CrossOver reports the virtual size, including uncommitted reservations.
+        assert_eq!(commit_bytes(0, 50169 << 20, false), 0);
     }
 
     #[test]

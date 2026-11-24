@@ -335,6 +335,8 @@ Fill the reusable DXIL cache ahead of a run with the read-only package wrapper. 
     logged with the interface and method name. Very verbose: use it for a short run.
 - `XCL_ACTIVITY=1` logs rendering, streaming and memory activity every two seconds. Under Wine,
   the process commit figure is Wine's estimate from anonymous resident memory and swap.
+- `XCL_ACTIVITY=1` logs rendering, streaming and memory activity every two seconds. Under Wine on Linux,
+  missing private usage falls back to an estimate from anonymous resident memory and swap.
 - Title data: `%LOCALAPPDATA%\XCL\<title>\` (`%XCL_DATA_ROOT%`): `xcl.toml`, `overlay\`, `saves\`,
   `pls\` (the title's `S:\`), `temp\` (`T:\`), `cache\`, `logs\xcl.log`, `logs\report.json` (the
   previous run's: `xcl.prev.log`, `report.prev.json`).

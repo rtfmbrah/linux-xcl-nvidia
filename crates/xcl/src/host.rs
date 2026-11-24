@@ -60,7 +60,7 @@ pub fn host_main(boot_path: &Path) -> i32 {
                     d[0], d[1], d[2], d[3], d[4], d[5], d[6], d[7], d[8], d[9], d[10]
                 );
                 // where the memory is: the process's commit, video memory, and XCL's parts of it
-                let private = crate::hle::kernelx::process_private_bytes();
+                let private = crate::hle::kernelx::process_commit_bytes(crate::util::linux_wine());
                 let (local, non_local) = crate::hle::d3d12x::real::video_memory().unwrap_or((0, 0));
                 let (arenas, arenas_made) = crate::hle::d3d12x::vram::arena_bytes();
                 let (pools, pools_mapped) = crate::hle::d3d12x::sparse::pool_bytes();

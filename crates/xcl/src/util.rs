@@ -132,6 +132,23 @@ pub fn under_wine() -> bool {
     })
 }
 
+/// Wine on Linux reports anonymous resident bytes and swap in PagefileUsage.
+pub(crate) fn linux_wine() -> bool {
+    use std::ffi::{c_char, CStr};
+    use std::sync::OnceLock;
+    use windows_sys::Win32::System::LibraryLoader::{GetModuleHandleA, GetProcAddress};
+    static LINUX_WINE: OnceLock<bool> = OnceLock::new();
+    *LINUX_WINE.get_or_init(|| unsafe {
+        let ntdll = GetModuleHandleA(c"ntdll.dll".as_ptr().cast());
+        let Some(proc) = GetProcAddress(ntdll, c"wine_get_host_version".as_ptr().cast()) else { return false };
+        // Wine exports this C function and returns a pointer to a static host name.
+        let host_version: unsafe extern "C" fn(*mut *const c_char, *mut *const c_char) = std::mem::transmute(proc);
+        let mut name = std::ptr::null();
+        host_version(&mut name, std::ptr::null_mut());
+        !name.is_null() && CStr::from_ptr(name) == c"Linux"
+    })
+}
+
 /// Normalised DLL key: lower-case file name, ".dll" appended when no extension.
 pub fn dll_key(name: &str) -> String {
     let base = name.rsplit(['\\', '/']).next().unwrap_or(name);
