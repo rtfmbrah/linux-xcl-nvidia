@@ -1,0 +1,168 @@
+diff --git a/libs/vkd3d-shader/dxil.c b/libs/vkd3d-shader/dxil.c
+index b22d8604..a9cd4a03 100644
+--- a/libs/vkd3d-shader/dxil.c
++++ b/libs/vkd3d-shader/dxil.c
+@@ -1498,6 +1498,124 @@ static int vkd3d_dxil_converter_set_options(dxil_spv_converter converter,
+     return VKD3D_OK;
+ }
+ 
++/* linux-xcl-nvidia: XCL may ship a compute program as SPIR-V next to its DXIL, in an 'XSPV'
++ * part of the DXBC container: { u32 version (1); u32 workgroup[3]; u32 wave_size; SPIR-V }.
++ * Its DescriptorSet / Binding decorations name the D3D register space and index of root UAVs;
++ * they are rewritten here to this root signature's bindings, as dxil-spirv's remapping would
++ * place them. Anything else (or a root UAV vkd3d does not lower to an SSBO) refuses, and the
++ * DXIL is compiled as usual. */
++#define XCL_TAG_XSPV ((uint32_t)'X' | ((uint32_t)'S' << 8) | ((uint32_t)'P' << 16) | ((uint32_t)'V' << 24))
++
++static const uint32_t *xcl_find_xspv(const struct vkd3d_shader_code *dxbc, size_t *size)
++{
++    const uint8_t *d = dxbc->code;
++    uint32_t count, i, offset, tag, chunk_size;
++
++    if (dxbc->size < 32 || memcmp(d, "DXBC", 4))
++        return NULL;
++    memcpy(&count, d + 28, 4);
++    for (i = 0; i < count && 32 + 4 * (i + 1) <= dxbc->size; i++)
++    {
++        memcpy(&offset, d + 32 + 4 * i, 4);
++        if (offset + 8 > dxbc->size)
++            return NULL;
++        memcpy(&tag, d + offset, 4);
++        memcpy(&chunk_size, d + offset + 4, 4);
++        if (tag == XCL_TAG_XSPV && offset + 8 + chunk_size <= dxbc->size && chunk_size >= 20 + 20 && !(chunk_size & 3))
++        {
++            *size = chunk_size;
++            return (const uint32_t *)(d + offset + 8);
++        }
++    }
++    return NULL;
++}
++
++static bool xcl_remap_root_uav(const struct vkd3d_shader_interface_info *info, uint32_t space, uint32_t reg,
++        uint32_t *set, uint32_t *binding)
++{
++    unsigned int i;
++
++    if (!(info->flags & VKD3D_SHADER_INTERFACE_HEAP_LOWERING) || info->min_ssbo_alignment > 4)
++        return false;
++    for (i = 0; i < info->binding_count; i++)
++    {
++        const struct vkd3d_shader_resource_binding *b = &info->bindings[i];
++        if (b->type == VKD3D_SHADER_DESCRIPTOR_TYPE_UAV && b->register_space == space &&
++                reg >= b->register_index && reg - b->register_index < b->register_count &&
++                vkd3d_shader_binding_is_root_descriptor(b))
++        {
++            *set = b->binding.set;
++            *binding = b->binding.binding;
++            return true;
++        }
++    }
++    return false;
++}
++
++static bool xcl_take_spirv(const struct vkd3d_shader_code *dxbc, struct vkd3d_shader_code *spirv,
++        const struct vkd3d_shader_interface_info *info)
++{
++    uint32_t *words, set = 0, binding = 0, space, reg;
++    const uint32_t *part;
++    size_t size, n, i, j;
++
++    if (info->stage != VK_SHADER_STAGE_COMPUTE_BIT || !(part = xcl_find_xspv(dxbc, &size)) || part[0] != 1)
++        return false;
++    n = (size - 20) / 4;
++    if (!(words = vkd3d_malloc(n * 4)))
++        return false;
++    memcpy(words, part + 5, n * 4);
++    if (words[0] != 0x07230203)
++        goto fail;
++    /* decorations: DescriptorSet (34) and Binding (33) of the same target are rewritten together */
++    for (i = 5; i < n; i += words[i] >> 16)
++    {
++        if ((words[i] >> 16) == 0)
++            goto fail;
++        if ((words[i] & 0xffff) == 71 && (words[i] >> 16) == 4 && words[i + 2] == 34)
++        {
++            space = words[i + 3];
++            reg = ~0u;
++            for (j = 5; j < n; j += words[j] >> 16)
++            {
++                if ((words[j] >> 16) == 0)
++                    goto fail;
++                if ((words[j] & 0xffff) == 71 && (words[j] >> 16) == 4 && words[j + 1] == words[i + 1] && words[j + 2] == 33)
++                    reg = words[j + 3];
++            }
++            if (reg == ~0u || !xcl_remap_root_uav(info, space, reg, &set, &binding))
++                goto fail;
++            for (j = 5; j < n; j += words[j] >> 16)
++            {
++                if ((words[j] & 0xffff) == 71 && (words[j] >> 16) == 4 && words[j + 1] == words[i + 1])
++                {
++                    if (words[j + 2] == 34)
++                        words[j + 3] = set | 0x80000000u; /* marked: not read again as a register */
++                    else if (words[j + 2] == 33)
++                        words[j + 3] = binding;
++                }
++            }
++        }
++    }
++    for (i = 5; i < n; i += words[i] >> 16)
++        if ((words[i] & 0xffff) == 71 && (words[i] >> 16) == 4 && words[i + 2] == 34)
++            words[i + 3] &= ~0x80000000u;
++    spirv->code = words;
++    spirv->size = n * 4;
++    spirv->meta.cs_workgroup_size[0] = part[1];
++    spirv->meta.cs_workgroup_size[1] = part[2];
++    spirv->meta.cs_workgroup_size[2] = part[3];
++    spirv->meta.cs_wave_size_min = part[4];
++    spirv->meta.cs_wave_size_max = part[4];
++    spirv->meta.cs_wave_size_preferred = 0;
++    INFO("XCL: compute shader %016"PRIx64" taken as SPIR-V (%zu words).\n", spirv->meta.hash, n);
++    return true;
++
++fail:
++    vkd3d_free(words);
++    return false;
++}
++
+ int vkd3d_shader_compile_dxil(const struct vkd3d_shader_code *dxbc,
+         struct vkd3d_shader_code *spirv,
+         struct vkd3d_shader_code_debug *spirv_debug,
+@@ -1537,6 +1655,14 @@ int vkd3d_shader_compile_dxil(const struct vkd3d_shader_code *dxbc,
+         return ret;
+     }
+ 
++    if (xcl_take_spirv(dxbc, spirv, shader_interface_info))
++    {
++        vkd3d_shader_dump_shader(hash, dxbc, is_dxil ? "dxil" : "dxbc");
++        vkd3d_shader_extract_feature_meta(spirv);
++        vkd3d_shader_dump_spirv_shader(hash, spirv);
++        return ret;
++    }
++
+     dxil_spv_begin_thread_allocator_context();
+ 
+     vkd3d_shader_dump_shader(hash, dxbc, is_dxil ? "dxil" : "dxbc");
+diff --git a/libs/vkd3d/command.c b/libs/vkd3d/command.c
+index 2fa163c4..3c67d76f 100644
+--- a/libs/vkd3d/command.c
++++ b/libs/vkd3d/command.c
+@@ -3352,7 +3352,8 @@ static bool d3d12_command_allocator_allocate_query_from_heap_type(struct d3d12_c
+ 
+ static struct d3d12_command_allocator *d3d12_command_allocator_from_iface(ID3D12CommandAllocator *iface)
+ {
+-    if (!iface || iface->lpVtbl != &d3d12_command_allocator_vtbl)
++    /* XCL: objects it adopts carry an extended vtable; their layout is ours. */
++    if (!iface)
+         return NULL;
+ 
+     return impl_from_ID3D12CommandAllocator(iface);
+@@ -23462,7 +23463,8 @@ HRESULT d3d12_command_list_create(struct d3d12_device *device,
+ 
+ struct d3d12_command_list *d3d12_command_list_from_iface(ID3D12CommandList *iface)
+ {
+-    bool is_valid = false;
++    /* XCL: objects it adopts carry an extended vtable; their layout is ours. */
++    bool is_valid = true;
+     if (!iface)
+         return NULL;
+ 
