@@ -1,8 +1,8 @@
 diff --git a/libs/vkd3d-shader/dxil.c b/libs/vkd3d-shader/dxil.c
-index b22d8604..a9cd4a03 100644
+index b22d8604..e9d7c72e 100644
 --- a/libs/vkd3d-shader/dxil.c
 +++ b/libs/vkd3d-shader/dxil.c
-@@ -1498,6 +1498,124 @@ static int vkd3d_dxil_converter_set_options(dxil_spv_converter converter,
+@@ -1498,6 +1498,127 @@ static int vkd3d_dxil_converter_set_options(dxil_spv_converter converter,
      return VKD3D_OK;
  }
  
@@ -83,6 +83,9 @@ index b22d8604..a9cd4a03 100644
 +        if ((words[i] & 0xffff) == 71 && (words[i] >> 16) == 4 && words[i + 2] == 34)
 +        {
 +            space = words[i + 3];
++            /* vkd3d's virtual sets (descriptor heap 100, …) are already final */
++            if (space >= VKD3D_SHADER_GLOBAL_HEAP_VIRTUAL_DESCRIPTOR_SET && !(space & 0x80000000u))
++                continue;
 +            reg = ~0u;
 +            for (j = 5; j < n; j += words[j] >> 16)
 +            {
@@ -127,7 +130,7 @@ index b22d8604..a9cd4a03 100644
  int vkd3d_shader_compile_dxil(const struct vkd3d_shader_code *dxbc,
          struct vkd3d_shader_code *spirv,
          struct vkd3d_shader_code_debug *spirv_debug,
-@@ -1537,6 +1655,14 @@ int vkd3d_shader_compile_dxil(const struct vkd3d_shader_code *dxbc,
+@@ -1537,6 +1658,14 @@ int vkd3d_shader_compile_dxil(const struct vkd3d_shader_code *dxbc,
          return ret;
      }
  

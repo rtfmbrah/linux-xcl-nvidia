@@ -22,6 +22,9 @@ const CAP_INT8: u32 = 39;
 const CAP_GROUP_NON_UNIFORM: u32 = 61;
 const CAP_GROUP_NON_UNIFORM_BALLOT: u32 = 64;
 const CAP_GROUP_NON_UNIFORM_SHUFFLE: u32 = 65;
+const CAP_SHADER_NON_UNIFORM: u32 = 5301;
+const CAP_RUNTIME_DESCRIPTOR_ARRAY: u32 = 5302;
+const CAP_STORAGE_BUFFER_ARRAY_NON_UNIFORM_INDEXING: u32 = 5308;
 const SC_INPUT: u32 = 1;
 const SC_WORKGROUP: u32 = 4;
 const SC_PRIVATE: u32 = 6;
@@ -33,6 +36,9 @@ const DEC_BUILTIN: u32 = 11;
 const DEC_BINDING: u32 = 33;
 const DEC_DESCRIPTOR_SET: u32 = 34;
 const DEC_OFFSET: u32 = 35;
+const DEC_NON_UNIFORM: u32 = 5300;
+/// vkd3d-proton's virtual descriptor set of the shader-visible heap (`VKD3D_SHADER_GLOBAL_HEAP_VIRTUAL_DESCRIPTOR_SET`)
+const VKD3D_HEAP_SET: u32 = 100;
 const BUILTIN_WORKGROUP_ID: u32 = 26;
 const BUILTIN_LOCAL_INVOCATION_ID: u32 = 27;
 const BUILTIN_GLOBAL_INVOCATION_ID: u32 = 28;
@@ -49,7 +55,8 @@ const SEM_WORKGROUP_MEMORY: u32 = 0x100;
 enum Val {
     /// an ordinary SSA id
     Id(u32),
-    /// a raw buffer handle (`createHandleFromBinding` / `annotateHandle`): the buffer variable
+    /// a raw buffer handle (`createHandleFromBinding` / `annotateHandle`): the buffer
+    /// variable, or a pointer to one element of the heap's buffer array
     Buffer(u32),
     /// a `rawBufferLoad`'s result struct: buffer variable, word index id, component mask
     RawLoad(u32, u32),
@@ -57,8 +64,9 @@ enum Val {
     Ballot(u32),
     /// a two-result op (`dx.types.twoi32`, `i32c`, `splitDouble`): the two values
     Pair(u32, u32),
-    /// `createHandleFromHeap(index, sampler)`: not usable before `annotateHandle` says its kind
-    HeapHandle(bool),
+    /// `createHandleFromHeap(index, sampler, nonuniform)`: the index id; not usable before
+    /// `annotateHandle` says its kind
+    HeapHandle(bool, u32, bool),
     /// a value with no use in SPIR-V (dx.types constants, `void` results)
     None,
 }
@@ -81,6 +89,11 @@ struct Tx<'a> {
     ptr_sc: HashMap<Value, u32>,
     /// buffer variable → accesses seen (1 read, 2 write)
     buffer_access: HashMap<u32, u8>,
+    /// heap buffer handle (element pointer) → the heap variable it points into, and whether
+    /// its index is non-uniform
+    buffer_base: HashMap<u32, (u32, bool)>,
+    /// heap buffer variable → its element (block) type
+    heap_blocks: HashMap<u32, u32>,
     /// node being emitted (for `subst`)
     cur: usize,
     subst: Vec<(Vec<bool>, usize, u32)>,
@@ -269,6 +282,34 @@ impl<'a> Tx<'a> {
         var
     }
 
+    /// The heap's raw buffers (`ResourceDescriptorHeap[i]` as `(RW)ByteAddressBuffer`, SRVs
+    /// and UAVs apart): `uint data[]` blocks as a runtime array in
+    /// vkd3d's virtual descriptor-heap set (100, binding 0), as dxil-spirv declares them.
+    fn heap_buffers(&mut self, uav: bool) -> u32 {
+        let key = (u32::MAX, uav as u32);
+        if let Some(&v) = self.buffers.get(&key) {
+            return v;
+        }
+        self.w.capability(CAP_RUNTIME_DESCRIPTOR_ARRAY);
+        let u = self.uint();
+        let arr = self.w.ty(op::TYPE_RUNTIME_ARRAY, &[u]);
+        if !self.w_has_stride(arr) {
+            self.w.decorate(arr, DEC_ARRAY_STRIDE, &[4]);
+        }
+        let st = self.w.distinct_type(op::TYPE_STRUCT, &[arr]);
+        self.w.decorate(st, DEC_BLOCK, &[]);
+        self.w.member_decorate(st, 0, DEC_OFFSET, &[0]);
+        let heap = self.w.ty(op::TYPE_RUNTIME_ARRAY, &[st]);
+        let p = self.w.pointer(SC_STORAGE_BUFFER, heap);
+        let var = self.w.global_variable(p, SC_STORAGE_BUFFER);
+        self.w.decorate(var, DEC_DESCRIPTOR_SET, &[VKD3D_HEAP_SET]);
+        self.w.decorate(var, DEC_BINDING, &[0]);
+        self.buffers.insert(key, var);
+        self.heap_blocks.insert(var, st);
+        self.interface.push(var);
+        var
+    }
+
     fn w_has_stride(&mut self, arr: u32) -> bool {
         // the runtime array type is shared: decorate it once
         let key = u32::MAX - arr;
@@ -282,12 +323,16 @@ impl<'a> Tx<'a> {
     /// Pointer to word `index` of a buffer.
     /// `access`: 1 read, 2 write, 3 both (atomics); recorded for `NonWritable` / `NonReadable`.
     fn buffer_word(&mut self, buf: u32, index: u32, access: u8) -> u32 {
-        *self.buffer_access.entry(buf).or_default() |= access;
+        let (var, nonuniform) = self.buffer_base.get(&buf).copied().unwrap_or((buf, false));
+        *self.buffer_access.entry(var).or_default() |= access;
         let u = self.uint();
         let p = self.w.pointer(SC_STORAGE_BUFFER, u);
         let zero = self.w.constant_u32(0);
         let r = self.w.id();
         self.emit(op::ACCESS_CHAIN, &[p, r, buf, zero, index]);
+        if nonuniform {
+            self.w.decorate(r, DEC_NON_UNIFORM, &[]);
+        }
         r
     }
 
@@ -330,7 +375,7 @@ impl<'a> Tx<'a> {
             216 => match self.vals.get(&a[0]) {
                 // annotateHandle: the handle itself
                 Some(&v @ Val::Buffer(_)) => v,
-                Some(&Val::HeapHandle(sampler)) => {
+                Some(&Val::HeapHandle(sampler, index, nonuniform)) => {
                     // resource properties: kind (bits 0-7), UAV (bit 12); dword 1: format / stride
                     let props = match a[1] {
                         Value::Const(c) => match self.m.const_def(c).clone() {
@@ -340,6 +385,21 @@ impl<'a> Tx<'a> {
                         _ => vec![],
                     };
                     let p0 = props.first().copied().unwrap_or(0);
+                    let kind = p0 & 0xff;
+                    if !sampler && kind == 11 {
+                        let var = self.heap_buffers(p0 & 0x1000 != 0);
+                        let st = self.heap_blocks[&var];
+                        let pt = self.w.pointer(SC_STORAGE_BUFFER, st);
+                        let r = self.w.id();
+                        self.emit(op::ACCESS_CHAIN, &[pt, r, var, index]);
+                        if nonuniform {
+                            self.w.capability(CAP_SHADER_NON_UNIFORM);
+                            self.w.capability(CAP_STORAGE_BUFFER_ARRAY_NON_UNIFORM_INDEXING);
+                            self.w.decorate(r, DEC_NON_UNIFORM, &[]);
+                        }
+                        self.buffer_base.insert(r, (var, nonuniform));
+                        return Ok(Val::Buffer(r));
+                    }
                     return err(format!(
                         "heap {} kind {} {}",
                         if sampler { "sampler" } else if p0 & 0x1000 != 0 { "UAV" } else { "SRV" },
@@ -352,7 +412,9 @@ impl<'a> Tx<'a> {
             218 => {
                 // createHandleFromHeap(index, sampler, nonuniform)
                 let sampler = c(self, 1)? != 0;
-                Val::HeapHandle(sampler)
+                let index = self.id(a[0])?;
+                let nonuniform = self.m.const_u64(a[2]).is_some_and(|v| v != 0);
+                Val::HeapHandle(sampler, index, nonuniform)
             }
             139 => {
                 // rawBufferLoad(handle, offset, undef, mask, align): components read on extract
@@ -1847,6 +1909,8 @@ pub fn translate_compute(m: &Module, numthreads: [u32; 3]) -> Result<Vec<u32>, S
         pending_phis: Vec::new(),
         ptr_sc: HashMap::new(),
         buffer_access: HashMap::new(),
+        buffer_base: HashMap::new(),
+        heap_blocks: HashMap::new(),
         cur: 0,
         subst: Vec::new(),
         synth_ids: HashMap::new(),

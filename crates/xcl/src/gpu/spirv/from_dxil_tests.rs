@@ -263,3 +263,26 @@ fn partial_join() {
     s.raw_store(output, off, &[r]);
     finish(s, "partial_join");
 }
+
+/// Raw buffers from the descriptor heap: out = ResourceDescriptorHeap[tid & 3] (UAV,
+/// non-uniform), src = ResourceDescriptorHeap[5] (SRV); out[tid] = src[tid] + 1
+#[test]
+fn heap_buffers() {
+    let mut s = Shader::new(Stage::Compute, (6, 6));
+    let tid = s.thread_id(0);
+    let three = s.m.i32c(3);
+    let which = s.m.bin(BinOp::And, tid, three);
+    let out = s.heap_raw_buffer(which, true, true);
+    let five = s.m.i32c(5);
+    let src = s.heap_raw_buffer(five, false, false);
+    let four = s.m.i32c(4);
+    let off = s.m.bin(BinOp::Mul, tid, four);
+    let x = s.raw_load(src, off, 1)[0];
+    let one = s.m.i32c(1);
+    let y = s.m.bin(BinOp::Add, x, one);
+    s.raw_store(out, off, &[y]);
+    let words = finish(s, "heap_buffers");
+    // both heap arrays sit in vkd3d's virtual heap set 100, binding 0
+    let decorations = words.windows(4).filter(|w| w[0] == (4 << 16 | 71) && w[2] == 34 && w[3] == 100).count();
+    assert_eq!(decorations, 2);
+}
