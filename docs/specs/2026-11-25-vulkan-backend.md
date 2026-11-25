@@ -61,10 +61,13 @@ Until (2) exists, (1) goes live through **SPIR-V passthrough in our own vkd3d-pr
 
 ### 3.1 Shader backend
 
-- Interface: the lowering code calls ≈155 distinct builder functions of `Shader`/`Module`
-  (`set_block`, `phi`, `add_incoming`, `load`/`store`, `cast`, `extract`, constants, `dx.op`
-  wrappers in `ops.rs`). Step one is a refactor with no behaviour change: put those behind a trait
-  (`ShaderSink`), implemented by the existing DXIL module. The SPIR-V module implements it second.
+- Interface (decided 2026-11-25): the SPIR-V backend reads the translator's **in-memory DXIL
+  module** (`gpu/dxil/module.rs`: ~18 instruction kinds — bin/cast/cmp/select/extract/call/phi/
+  load/store/gep/atomics/alloca/br/cond_br/switch/ret — plus `dx.op.*` calls) and translates it,
+  instead of putting the ≈155 builder calls of the lowering code behind a trait. The lowering stays
+  untouched; the module only gains a read-only view. Structured control flow comes from merge/loop
+  hints the translator attaches to header blocks where it knows them (the compact form's loop and
+  switch first), with a small structurizer for the reducible shapes XCL emits as fallback.
 - SPIR-V writer: own code (the binary format is a flat word stream; XCL already writes LLVM
   bitstreams by hand). Dependencies must be GPL-2.0-compatible: `rspirv`/`spirv` are Apache-2.0
   only and **cannot** be used; the Khronos SPIR-V grammar/headers (MIT-style) can, with a
@@ -103,7 +106,7 @@ Own pipeline cache keyed by (translator source hash, SPIR-V hash, state, driver 
 | Stage | Content | Exit criterion |
 |---|---|---|
 | A | **Measure.** dxil-spirv time vs. driver time per large pipeline (offline: `xcl shaders --direct --dump` → time dxil-spirv and a Vulkan compile of its output); vkd3d cache hit rate in a run (`VKD3D_CONFIG=pipeline_library_log`); newer vkd3d-proton/dxil-spirv as baseline | Numbers that say how much stage B/C can gain |
-| B0 | `ShaderSink` trait over the DXIL builder, no behaviour change | All direct-DXIL tests unchanged |
+| B0 | SPIR-V writer (`gpu/spirv/writer.rs`) + read-only view of the DXIL module; native Linux tests (`scripts/linux/test-native.sh`, `spirv-val`) | Writer output validates; no behaviour change |
 | B1 | SPIR-V writer + compute kernels of the test ABI; `spirv-val` as oracle; differential GPU tests through a small Vulkan compute runner (`ash`) against the existing RDNA instruction tests | ALU/memory/cross-lane tests pass on NVIDIA and AMD |
 | B2 | Compact form (giant compute programs) | ScreenProbes-class programs translate, validate, compile in seconds |
 | C | SPIR-V passthrough in our vkd3d-proton build (container part or private interface), compute first, DXIL fallback | GTA world load with SPIR-V compute pipelines; load time and RAM measured against stage A |

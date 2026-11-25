@@ -23,8 +23,15 @@ pub(super) mod split;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct Ty(u32);
 
+impl Ty {
+    /// The type's index in the module's type table (stable while the module lives).
+    pub(crate) fn index(self) -> u32 {
+        self.0
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-enum TypeDef {
+pub(crate) enum TypeDef {
     Void,
     Label,
     Metadata,
@@ -50,7 +57,7 @@ pub enum Value {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-enum ConstDef {
+pub(crate) enum ConstDef {
     /// Sign-extended to 64 bits from the type's width.
     Int(Ty, i64),
     /// Raw IEEE bits of the type's width.
@@ -96,14 +103,14 @@ impl FnAttrs {
 }
 
 #[derive(Clone)]
-struct GlobalDef {
-    name: String,
+pub(crate) struct GlobalDef {
+    pub(crate) name: String,
     /// Value type (the global itself is a pointer to it).
-    ty: Ty,
+    pub(crate) ty: Ty,
     ptr: Ty,
-    addrspace: u32,
-    init: Option<Value>,
-    constant: bool,
+    pub(crate) addrspace: u32,
+    pub(crate) init: Option<Value>,
+    pub(crate) constant: bool,
     align: u32,
 }
 
@@ -191,7 +198,7 @@ pub enum RmwOp {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-enum Op {
+pub(crate) enum Op {
     Bin(BinOp, Value, Value, u64),
     Cast(CastOp, Value, Ty),
     Cmp(Pred, Value, Value),
@@ -511,6 +518,32 @@ impl Module {
             },
             Value::Inst(i) => self.insts[i as usize].ty,
         }
+    }
+
+    // ---- read-only view for backends that translate the module (`gpu::spirv`); see also
+    // `block_count` / `block_insts` / `inst_info` under "introspection"
+
+    /// The full operation of an instruction ([`Module::inst_info`] is the summary).
+    pub(crate) fn inst_op(&self, i: u32) -> &Op {
+        &self.insts[i as usize].op
+    }
+    /// The result type of an instruction (`void` for stores and terminators).
+    pub(crate) fn inst_ty(&self, i: u32) -> Ty {
+        self.insts[i as usize].ty
+    }
+    pub(crate) fn type_def(&self, t: Ty) -> &TypeDef {
+        &self.types[t.0 as usize]
+    }
+    pub(crate) fn const_def(&self, c: u32) -> &ConstDef {
+        &self.consts[c as usize]
+    }
+    pub(crate) fn global_def(&self, g: u32) -> &GlobalDef {
+        &self.globals[g as usize]
+    }
+    /// A declared function's name (`dx.op.*` intrinsics) and its type.
+    pub(crate) fn func_decl(&self, f: u32) -> (&str, Ty) {
+        let d = &self.funcs[f as usize];
+        (&d.name, d.ty)
     }
 
     // ---- blocks
