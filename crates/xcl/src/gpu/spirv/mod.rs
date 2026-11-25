@@ -7,6 +7,16 @@
 //!   specification (unified1), whose grammar is under the MIT-style Khronos licence.
 
 pub mod from_dxil;
+
+static WANTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Whether the direct translator also makes SPIR-V of compute entries (`xcl shaders --spirv`).
+pub fn wanted() -> bool {
+    WANTED.load(std::sync::atomic::Ordering::Relaxed)
+}
+pub fn set_wanted(on: bool) {
+    WANTED.store(on, std::sync::atomic::Ordering::Relaxed);
+}
 pub mod writer;
 
 #[cfg(test)]

@@ -825,6 +825,7 @@ struct ShadersOptions {
     max_bytes: usize,
     timeout: u64,
     lanes: bool,
+    spirv: bool,
     hash: Option<u64>,
     dump: Option<PathBuf>,
 }
@@ -860,6 +861,7 @@ fn parse_args(args: &[String]) -> Result<ShadersOptions, String> {
         max_bytes: 16384,
         timeout: 10,
         lanes: false,
+        spirv: false,
         hash: None,
         dump: None,
     };
@@ -898,6 +900,7 @@ fn parse_args(args: &[String]) -> Result<ShadersOptions, String> {
             "--max-bytes" => opts.max_bytes = p.parse_usize("--max-bytes")?,
             "--timeout" => opts.timeout = p.parse_u64("--timeout")?,
             "--lanes" => opts.lanes = true,
+            "--spirv" => opts.spirv = true,
             "--hash" => opts.hash = Some(p.parse_hex_u64("--hash")?),
             "--dump" => opts.dump = Some(PathBuf::from(p.value("--dump")?)),
             other => return Err(crate::cli::Parser::unexpected(other)),
@@ -2291,6 +2294,15 @@ fn direct_sweep(input: &Input, opts: &ShadersOptions, t0: std::time::Instant) ->
     let lanes_bytes = AtomicUsize::new(0);
     let lanes_vs = AtomicUsize::new(0);
     let lanes_why: Mutex<HashMap<String, usize>> = Mutex::new(HashMap::new());
+    // `--spirv`: compute programs through the SPIR-V backend too (`gpu::spirv`, fork
+    // linux-xcl-nvidia): how many translate, their size against the DXIL, the refusals ranked
+    let spirv = opts.spirv;
+    crate::gpu::spirv::set_wanted(spirv);
+    let spirv_tried = AtomicUsize::new(0);
+    let spirv_ok = AtomicUsize::new(0);
+    let spirv_bytes = AtomicUsize::new(0);
+    let spirv_dxil = AtomicUsize::new(0);
+    let spirv_why: Mutex<HashMap<String, usize>> = Mutex::new(HashMap::new());
     // `--hash H`: only the container whose `[SHADER]` hash (FNV-64 of the container) is H, every
     // record searched; `--dump DIR`: write each program's direct DXIL (and with `--compare` the
     // HLSL path's source and DXIL) to DIR, for diffing the two (`dxc -dumpbin`)
@@ -2340,10 +2352,25 @@ fn direct_sweep(input: &Input, opts: &ShadersOptions, t0: std::time::Instant) ->
                             let (tx, rx) = std::sync::mpsc::channel();
                             let (c, m) = (code.to_vec(), mode.clone());
                             std::thread::spawn(move || {
-                                let _ = tx.send(coverage::translate_mode(&c, &m, o, validate));
+                                let _ = tx.send(coverage::translate_mode_kernel(&c, &m, o, validate));
                             });
                             rx.recv_timeout(timeout).unwrap_or_else(|_| Err(format!("timeout: over {} s", timeout.as_secs())))
                         };
+                        let (r, spv) = match r {
+                            Ok(k) => (Ok(k.dxil), k.spirv),
+                            Err(e) => (Err(e), None),
+                        };
+                        if let Some(spv) = &spv {
+                            spirv_tried.fetch_add(1, Ordering::Relaxed);
+                            match spv {
+                                Ok(words) => {
+                                    spirv_ok.fetch_add(1, Ordering::Relaxed);
+                                    spirv_bytes.fetch_add(words.len() * 4, Ordering::Relaxed);
+                                    spirv_dxil.fetch_add(r.as_ref().map_or(0, |d| d.len()), Ordering::Relaxed);
+                                }
+                                Err(e) => *spirv_why.lock().unwrap().entry(survey_key(e)).or_default() += 1,
+                            }
+                        }
                         let time = t.elapsed();
                         if let (true, recomp::Mode::Compute(cs)) = (lanes, &mode) {
                             lanes_tried.fetch_add(1, Ordering::Relaxed);
@@ -2374,6 +2401,11 @@ fn direct_sweep(input: &Input, opts: &ShadersOptions, t0: std::time::Instant) ->
                         match &r {
                             Ok(dxil) => dump("direct.dxil", dxil),
                             Err(e) => dump("direct.err.txt", e.as_bytes()),
+                        }
+                        match &spv {
+                            Some(Ok(words)) => dump("spv", &words.iter().flat_map(|w| w.to_le_bytes()).collect::<Vec<u8>>()),
+                            Some(Err(e)) => dump("spv.err.txt", e.as_bytes()),
+                            None => {}
                         }
                         let hlsl_size = (compare && r.is_ok())
                             .then(|| {
@@ -2412,6 +2444,12 @@ fn direct_sweep(input: &Input, opts: &ShadersOptions, t0: std::time::Instant) ->
             why.sort_by(|a, b| b.1.cmp(&a.1));
             why.truncate(top);
             println!("per-lane form: {} of {} compute programs; where it translates, {} B against {} B per instruction; refused for: {why:?}", lanes_ok.load(Ordering::Relaxed), lanes_tried.load(Ordering::Relaxed), lanes_bytes.load(Ordering::Relaxed), lanes_vs.load(Ordering::Relaxed));
+        }
+        if spirv {
+            let mut why: Vec<(String, usize)> = spirv_why.into_inner().unwrap().into_iter().collect();
+            why.sort_by(|a, b| b.1.cmp(&a.1));
+            why.truncate(top);
+            println!("SPIR-V: {} of {} compute programs; where it translates, {} B against {} B of DXIL; refused for: {why:?}", spirv_ok.load(Ordering::Relaxed), spirv_tried.load(Ordering::Relaxed), spirv_bytes.load(Ordering::Relaxed), spirv_dxil.load(Ordering::Relaxed));
         }
         print!("{}", rep.text(top));
         println!("time {:.1} s", t0.elapsed().as_secs_f64());

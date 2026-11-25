@@ -248,6 +248,11 @@ pub fn percentiles(v: &[u64]) -> (u64, u64, u64) {
 /// own thread) come back as `"panic: …"`; `validate` runs DXC's validator on the result
 /// (the translator itself only validates in debug / test builds).
 pub fn translate_mode(code: &[u8], mode: &Mode, o: KernelOptions, validate: bool) -> Result<Vec<u8>, String> {
+    translate_mode_kernel(code, mode, o, validate).map(|k| k.dxil)
+}
+
+/// [`translate_mode`] with the whole [`kernel::Kernel`] (its SPIR-V too, when wanted).
+pub fn translate_mode_kernel(code: &[u8], mode: &Mode, o: KernelOptions, validate: bool) -> Result<kernel::Kernel, String> {
     let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| match mode {
         Mode::Kernel => kernel::translate_full(code, o),
         Mode::Compute(cs) => kernel::translate_compute(code, o, cs),
@@ -266,7 +271,7 @@ pub fn translate_mode(code: &[u8], mode: &Mode, o: KernelOptions, validate: bool
     if validate {
         super::validate::validate(&k.dxil).map_err(|e| format!("validator: {}", e.lines().next().unwrap_or("")))?;
     }
-    Ok(k.dxil)
+    Ok(k)
 }
 
 /// Deterministic sample of `n` of `0..len` (splitmix64-driven partial Fisher–Yates), in

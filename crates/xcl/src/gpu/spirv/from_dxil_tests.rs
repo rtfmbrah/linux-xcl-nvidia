@@ -91,17 +91,57 @@ fn wave_ops_and_barrier() {
     finish(s, "wave_ops");
 }
 
+/// sum = 0; i = 0; do { sum += i * 3; i += 1 } while (i <= tid); out[tid] = sum   (a do-while
+/// loop: header = latch, one exit)
 #[test]
-fn loops_are_refused_with_a_message() {
+fn counting_loop() {
+    let mut s = Shader::new(Stage::Compute, (6, 6));
+    let output = s.raw_uav(0, 0);
+    let tid = s.thread_id(0);
+    let entry = s.m.current_block();
+    let head = s.m.new_block();
+    let exit = s.m.new_block();
+    s.m.br(head);
+    s.m.set_block(head);
+    let i32 = s.m.i32();
+    let i = s.m.phi(i32);
+    let sum = s.m.phi(i32);
+    let three = s.m.i32c(3);
+    let one = s.m.i32c(1);
+    let zero = s.m.i32c(0);
+    let t = s.m.bin(BinOp::Mul, i, three);
+    let sum2 = s.m.bin(BinOp::Add, sum, t);
+    let i2 = s.m.bin(BinOp::Add, i, one);
+    let more = s.m.cmp(Pred::ULe, i2, tid);
+    s.m.cond_br(more, head, exit);
+    s.m.add_incoming(i, zero, entry);
+    s.m.add_incoming(i, i2, head);
+    s.m.add_incoming(sum, zero, entry);
+    s.m.add_incoming(sum, sum2, head);
+    s.m.set_block(exit);
+    let four = s.m.i32c(4);
+    let off = s.m.bin(BinOp::Mul, tid, four);
+    s.raw_store(output, off, &[sum2]);
+    finish(s, "counting_loop");
+}
+
+/// A loop with two exits is refused with a message (until it is restructured).
+#[test]
+fn loop_with_two_exits_is_refused() {
     let mut s = Shader::new(Stage::Compute, (6, 6));
     let head = s.m.new_block();
+    let body = s.m.new_block();
+    let (exit1, exit2) = (s.m.new_block(), s.m.new_block());
     s.m.br(head);
     s.m.set_block(head);
     let t = s.m.i1c(true);
-    let exit = s.m.new_block();
-    s.m.cond_br(t, head, exit);
-    s.m.set_block(exit);
+    s.m.cond_br(t, body, exit1);
+    s.m.set_block(body);
+    s.m.cond_br(t, head, exit2);
+    s.m.set_block(exit1);
+    s.m.ret();
+    s.m.set_block(exit2);
     s.m.ret();
     let e = translate_compute(&s.m, [1, 1, 1]).unwrap_err();
-    assert!(e.contains("loop"), "{e}");
+    assert!(e.contains("exits"), "{e}");
 }

@@ -64,6 +64,8 @@ pub fn translate(code: &[u8], o: KernelOptions) -> Result<Vec<u8>, String> {
 /// kernel's `Translation::static_samplers`).
 pub struct Kernel {
     pub dxil: Vec<u8>,
+    /// The same program as SPIR-V (`gpu::spirv`), when `gpu::spirv::wanted()`: compute entries only.
+    pub spirv: Option<Result<Vec<u32>, String>>,
     pub static_samplers: Vec<([u32; 4], bool)>,
     pub dispatch_chain: Option<std::sync::Arc<DispatchChain>>,
 }
@@ -622,6 +624,7 @@ impl Lw {
         }
         let stage = self.s.stage;
         let mut dispatch_chain = None;
+        let mut spirv = None;
         let c = if matches!(stage, Stage::Vertex | Stage::Pixel) {
             let g = self.gfx.take().ok_or("graphics entry without graphics I/O")?;
             let info = if stage == Stage::Pixel { super::graphics::StageInfo::Pixel { early_depth_stencil: false } } else { super::graphics::StageInfo::Vertex };
@@ -629,6 +632,14 @@ impl Lw {
         } else if limit > 0 && (numthreads == [32, 1, 1] || split_tid.is_some()) && hw == 32 {
             self.s.m.optimize();
             dispatch_chain = self.s.split_compute(numthreads, split_tid, limit).map(std::sync::Arc::new);
+            self.s.finish_optimized(numthreads, Some(hw))
+        } else if stage == Stage::Compute && crate::gpu::spirv::wanted() {
+            // the module as `try_finish` leaves it, translated before it is written as DXIL
+            if !self.s.m.terminated() {
+                self.s.m.ret();
+            }
+            self.s.m.optimize();
+            spirv = Some(crate::gpu::spirv::from_dxil::translate_compute(&self.s.m, numthreads));
             self.s.finish_optimized(numthreads, Some(hw))
         } else {
             self.s.try_finish(numthreads, Some(hw))
@@ -640,7 +651,7 @@ impl Lw {
                 return Err(format!("direct DXIL failed validation: {e}\n--- disassembly ---\n{dis}"));
             }
         }
-        Ok(Kernel { dxil: c, static_samplers: self.static_used.iter().map(|&(w, c, _)| (w, c)).collect(), dispatch_chain })
+        Ok(Kernel { dxil: c, spirv, static_samplers: self.static_used.iter().map(|&(w, c, _)| (w, c)).collect(), dispatch_chain })
     }
 }
 

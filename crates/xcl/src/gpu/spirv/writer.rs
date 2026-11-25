@@ -253,6 +253,13 @@ impl Writer {
         id
     }
 
+    /// A module-scope `OpVariable` with an initializer (Private constant tables).
+    pub fn global_variable_init(&mut self, ptr_ty: u32, storage_class: u32, init: u32) -> u32 {
+        let id = self.id();
+        self.emit(Section::Globals, op::VARIABLE, &[ptr_ty, id, storage_class, init]);
+        id
+    }
+
     /// The finished module: header, then the sections in logical-layout order.
     pub fn finish(self) -> Vec<u32> {
         let mut out = vec![MAGIC, VERSION_1_6, 0, self.next_id, 0];
