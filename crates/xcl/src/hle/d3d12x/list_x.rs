@@ -3672,13 +3672,61 @@ unsafe fn gpu_va(list: *mut c_void, va: u64, bytes: usize, what: &str, mirror: b
 /// title binds one buffer at many offsets (a ring it fills through the frame: a retail title's
 /// views all end at the buffer's end), so a mirror covers a 64 KiB-aligned range and a view
 /// inside a mirrored range uses that mirror at its offset.
-static MIRRORS: Mutex<Vec<(u64, usize, usize)>> = Mutex::new(Vec::new());
-/// bytes of mirrors made (never freed)
+static MIRRORS: Mutex<Vec<(u64, usize, usize, std::time::Instant)>> = Mutex::new(Vec::new());
 static MIRROR_BYTES: AtomicU64 = AtomicU64::new(0);
+const MIRROR_IDLE: std::time::Duration = std::time::Duration::from_secs(10);
+static MIRRORS_SWEPT: Mutex<Option<std::time::Instant>> = Mutex::new(None);
+static MIRRORS_FREED: AtomicU64 = AtomicU64::new(0);
+
+fn find_mirror(g: &mut [(u64, usize, usize, std::time::Instant)], va: u64, bytes: usize) -> Option<usize> {
+    let e = g.iter_mut().find(|e| va >= e.0 && va + bytes as u64 <= e.0 + e.1 as u64)?;
+    e.3 = std::time::Instant::now();
+    Some(e.2 + (va - e.0) as usize)
+}
 
 /// Where `[va, va + bytes)` is in a mirror, if it is in one.
 fn mirrored(va: u64, bytes: usize) -> Option<usize> {
-    MIRRORS.lock().unwrap().iter().find(|&&(s, l, _)| va >= s && va + bytes as u64 <= s + l as u64).map(|&(s, _, m)| m + (va - s) as usize)
+    find_mirror(&mut MIRRORS.lock().unwrap(), va, bytes)
+}
+
+fn take_idle_mirrors(g: &mut Vec<(u64, usize, usize, std::time::Instant)>, now: std::time::Instant, idle: std::time::Duration) -> Vec<(usize, usize)> {
+    let mut gone = Vec::new();
+    g.retain(|e| {
+        let keep = now.duration_since(e.3) < idle;
+        if !keep {
+            gone.push((e.2, e.1));
+        }
+        keep
+    });
+    gone
+}
+
+unsafe fn free_mirrors(gone: Vec<(usize, usize)>) {
+    if gone.is_empty() {
+        return;
+    }
+    let Some(u) = crate::gpu::uma::get() else { return };
+    let mut bytes = 0u64;
+    for (p, len) in gone.iter().copied() {
+        let freed = if u.is_sparse(p) { super::sparse::free(p) } else { u.free(p) };
+        if freed {
+            bytes += len as u64;
+        }
+    }
+    MIRROR_BYTES.fetch_sub(bytes.min(MIRROR_BYTES.load(Ordering::Relaxed)), Ordering::Relaxed);
+    let n = MIRRORS_FREED.fetch_add(gone.len() as u64, Ordering::Relaxed) + gone.len() as u64;
+    if (n - gone.len() as u64).leading_zeros() != n.leading_zeros() {
+        crate::xlog_info!("D3D12.X: {n} mirrors unused for {} s freed so far ({} MB of mirrors left)", MIRROR_IDLE.as_secs(), MIRROR_BYTES.load(Ordering::Relaxed) >> 20);
+    }
+}
+
+fn sweep_due(now: std::time::Instant) -> bool {
+    let mut g = MIRRORS_SWEPT.lock().unwrap();
+    if g.is_some_and(|t| now.duration_since(t) < std::time::Duration::from_secs(1)) {
+        return false;
+    }
+    *g = Some(now);
+    true
 }
 
 /// The mirror address of the title's buffer at `va`; its range's mirror is made (and filled
@@ -3687,11 +3735,14 @@ unsafe fn mirror_of(va: u64, bytes: usize, what: &str) -> Option<usize> {
     if let Some(p) = mirrored(va, bytes) {
         return Some(p);
     }
+    let now = std::time::Instant::now();
+    let gone = if sweep_due(now) { take_idle_mirrors(&mut MIRRORS.lock().unwrap(), now, MIRROR_IDLE) } else { Vec::new() };
+    free_mirrors(gone);
     let mut g = MIRRORS.lock().unwrap();
     // again under the lock: two lists binding one new range at once must share a mirror (a
     // second one would never be synced – every later lookup finds the first)
-    if let Some(&(s, _, m)) = g.iter().find(|&&(s, l, _)| va >= s && va + bytes as u64 <= s + l as u64) {
-        return Some(m + (va - s) as usize);
+    if let Some(p) = find_mirror(&mut g, va, bytes) {
+        return Some(p);
     }
     let start = va & !0xffff;
     let len = ((va + bytes as u64 + 0xffff) & !0xffff) - start;
@@ -3710,7 +3761,7 @@ unsafe fn mirror_of(va: u64, bytes: usize, what: &str) -> Option<usize> {
         None => u.alloc(len, 0x1_0000)? as usize,
     };
     std::ptr::copy_nonoverlapping(start as *const u8, p as *mut u8, len);
-    g.push((start, len, p));
+    g.push((start, len, p, std::time::Instant::now()));
     let total = MIRROR_BYTES.fetch_add(len as u64, Ordering::Relaxed) + len as u64;
     if g.len() <= 8 || g.len().is_power_of_two() {
         crate::xlog_warn!("D3D12.X: {what} at {va:#x} ({bytes} bytes) is outside unified memory – {start:#x}..{:#x} mirrored at {p:#x}, each draw copies what it reads ({} mirrors, {} MB)", start + len as u64, g.len(), total >> 20);
@@ -7431,5 +7482,15 @@ mod tests {
             console_heap::unregister(go);
             assert!(got.iter().all(|&v| v == 0xDEAD_BEEF), "the UAV was not cleared: {:x?}", &got[..4]);
         }
+    #[test]
+    fn a_mirror_no_draw_used_for_the_idle_time_is_taken_out_and_a_used_one_stays() {
+        let t0 = std::time::Instant::now() - std::time::Duration::from_secs(60);
+        let mut g = vec![(0x1_0000u64, 0x1_0000usize, 0xa_0000usize, t0), (0x4_0000, 0x2_0000, 0xb_0000, t0)];
+        assert_eq!(find_mirror(&mut g, 0x4_1000, 0x100), Some(0xb_1000));
+        assert!(g[1].3 > t0, "a lookup marks the mirror used");
+        let gone = take_idle_mirrors(&mut g, std::time::Instant::now(), std::time::Duration::from_secs(10));
+        assert_eq!(gone, [(0xa_0000, 0x1_0000)]);
+        assert_eq!(g.len(), 1);
+        assert_eq!(find_mirror(&mut g, 0x1_0000, 0x10), None, "a range whose mirror went gets a new one");
     }
 }
