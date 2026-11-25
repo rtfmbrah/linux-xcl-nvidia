@@ -7482,6 +7482,8 @@ mod tests {
             console_heap::unregister(go);
             assert!(got.iter().all(|&v| v == 0xDEAD_BEEF), "the UAV was not cleared: {:x?}", &got[..4]);
         }
+    }
+
     #[test]
     fn a_mirror_no_draw_used_for_the_idle_time_is_taken_out_and_a_used_one_stays() {
         let t0 = std::time::Instant::now() - std::time::Duration::from_secs(60);

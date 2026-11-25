@@ -289,6 +289,12 @@ mod translated {
             let id = if Backend::current() != Backend::Hlsl {
                 identity_for(&id.to_string(), &format!("dispatch-split-{}", crate::gpu::dxil::kernel::dispatch_piece_limit()))
             } else { id };
+            // `XCL_DIRECT_COMPACT_KB` other than the default: the retry in the compact form
+            // happens at another size, another output
+            let id = match crate::gpu::dxil::kernel::compact_over_bytes() {
+                b if Backend::current() != Backend::Hlsl && b != 1536 * 1024 => identity_for(&id.to_string(), &format!("xcl-direct-compact-kb-{}", b >> 10)),
+                _ => id,
+            };
             // `XCL_PER_LANE=1` (direct compute only): its entries under their own identity
             if Backend::current() != Backend::Hlsl && crate::gpu::recomp::lower_dxil::enabled() {
                 identity_for(&id.to_string(), concat!("xcl-per-lane-", env!("XCL_PER_LANE_SOURCE_ID")))

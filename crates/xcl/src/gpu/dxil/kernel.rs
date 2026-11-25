@@ -150,7 +150,44 @@ pub fn translate_compute_on(code: &[u8], o: KernelOptions, cs: &CsInterface, wav
     translate_entry(code, o, Entry::Compute(cs.clone()), compact_mode(), None, tables)
 }
 
+/// `XCL_DIRECT_COMPACT_KB`: a compute program whose plain DXIL is over this many KiB is
+/// translated again in the compact form, kept when smaller (default 1536; 0: off). On
+/// NVIDIA the driver's compile time explodes between 2 and 4 MB of DXIL (a 3.9 MB plain
+/// compute program was still in the driver after 5 minutes, its compact form a few seconds),
+/// and a title that binds such a pipeline waits for it.
+pub fn compact_over_bytes() -> usize {
+    static B: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *B.get_or_init(|| compact_over_kb(std::env::var("XCL_DIRECT_COMPACT_KB").ok().as_deref()).saturating_mul(1024))
+}
+
+fn compact_over_kb(set: Option<&str>) -> usize {
+    set.and_then(|v| v.trim().parse().ok()).unwrap_or(1536)
+}
+
 fn translate_entry(
+    code: &[u8],
+    o: KernelOptions,
+    entry: Entry,
+    compact: Option<bool>,
+    nest: Option<super::compact::Nest>,
+    tables: usize,
+) -> Result<Kernel, String> {
+    let retry = compact.is_none() && matches!(entry, Entry::Kernel | Entry::Compute(_));
+    let plain = translate_entry_once(code, o, entry.clone(), compact, nest, tables)?;
+    let over = compact_over_bytes();
+    if !retry || over == 0 || plain.dxil.len() <= over {
+        return Ok(plain);
+    }
+    match translate_entry_once(code, o, entry, Some(true), nest, tables) {
+        Ok(c) if c.dxil.len() < plain.dxil.len() => {
+            crate::xlog_info!("[SHADER] direct DXIL: {} B plain over XCL_DIRECT_COMPACT_KB, {} B compact kept", plain.dxil.len(), c.dxil.len());
+            Ok(c)
+        }
+        _ => Ok(plain),
+    }
+}
+
+fn translate_entry_once(
     code: &[u8],
     o: KernelOptions,
     entry: Entry,
@@ -974,4 +1011,17 @@ fn geom_init(lw: &mut Lw, g: &GsInterface, _tid: Value, io: super::shader::RawUa
     let none = lw.c(u32::MAX);
     lw.wr(base, none);
     lw.geom = Some(super::lower_geom::GeomCtx { g: g.clone(), emitted, strip, ntri, base, tri, maxt, rec });
+}
+
+#[cfg(test)]
+mod compact_over_tests {
+    use super::compact_over_kb;
+
+    #[test]
+    fn the_compact_retry_is_over_1536_kib_unless_set_and_off_at_zero() {
+        assert_eq!(compact_over_kb(None), 1536);
+        assert_eq!(compact_over_kb(Some("4096")), 4096);
+        assert_eq!(compact_over_kb(Some("0")), 0);
+        assert_eq!(compact_over_kb(Some("nope")), 1536);
+    }
 }
