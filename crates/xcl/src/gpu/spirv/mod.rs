@@ -6,7 +6,10 @@
 //!   GPL-2.0-compatible. Opcode and enumerant numbers are from the Khronos SPIR-V
 //!   specification (unified1), whose grammar is under the MIT-style Khronos licence.
 
+pub mod from_dxil;
 pub mod writer;
 
 #[cfg(test)]
 mod writer_tests;
+#[cfg(test)]
+mod from_dxil_tests;
