@@ -39,9 +39,28 @@ pub fn allowed(dxil: &[u8]) -> bool {
     list.as_ref().is_none_or(|l| l.contains(&crate::gpu::shader::fnv64(dxil)))
 }
 
-/// The `XSPV` part: version 1, the workgroup size, the wave size, then the SPIR-V words.
+/// Logs what became of a compute program's SPIR-V at run time (`attached`, or why there is
+/// none): each outcome the first time, then every 100th.
+pub fn note_outcome(reason: &str) {
+    static SEEN: std::sync::Mutex<Option<std::collections::HashMap<String, u32>>> = std::sync::Mutex::new(None);
+    let mut g = SEEN.lock().unwrap();
+    let n = g.get_or_insert_with(Default::default).entry(reason.to_string()).or_insert(0);
+    *n += 1;
+    if *n == 1 || *n % 100 == 0 {
+        crate::xlog_info!("SPIR-V: compute programs: {reason} ({n}x)");
+        if std::env::var("XCL_SPIRV_DEBUG").is_ok() {
+            eprintln!("SPIR-V: compute programs: {reason} ({n}x)");
+        }
+    }
+}
+
+/// The `XSPV` part (version 2): the workgroup size, the wave size, the root UAVs the program
+/// reads through buffer device addresses (bit k: `u<k>`, from the SPIR-V generator word), then
+/// the SPIR-V words. The fork's vkd3d-proton hook checks the bindings against the root
+/// signature and refuses (dxil-spirv compiles the DXIL) where they differ.
 pub fn xspv_part(numthreads: [u32; 3], wave: u32, words: &[u32]) -> Vec<u8> {
-    [1, numthreads[0], numthreads[1], numthreads[2], wave].iter().chain(words).flat_map(|w| w.to_le_bytes()).collect()
+    let root_uavs = words.get(2).map_or(0, |g| g & 0xffff);
+    [2, numthreads[0], numthreads[1], numthreads[2], wave, root_uavs].iter().chain(words).flat_map(|w| w.to_le_bytes()).collect()
 }
 pub fn set_wanted(on: bool) {
     WANTED.store(on, std::sync::atomic::Ordering::Relaxed);

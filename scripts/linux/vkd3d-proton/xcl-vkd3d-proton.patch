@@ -1,18 +1,24 @@
 diff --git a/libs/vkd3d-shader/dxil.c b/libs/vkd3d-shader/dxil.c
-index b22d8604..e9d7c72e 100644
+index b22d8604..5238271f 100644
 --- a/libs/vkd3d-shader/dxil.c
 +++ b/libs/vkd3d-shader/dxil.c
-@@ -1498,6 +1498,127 @@ static int vkd3d_dxil_converter_set_options(dxil_spv_converter converter,
+@@ -1498,6 +1498,217 @@ static int vkd3d_dxil_converter_set_options(dxil_spv_converter converter,
      return VKD3D_OK;
  }
  
 +/* linux-xcl-nvidia: XCL may ship a compute program as SPIR-V next to its DXIL, in an 'XSPV'
-+ * part of the DXBC container: { u32 version (1); u32 workgroup[3]; u32 wave_size; SPIR-V }.
-+ * Its DescriptorSet / Binding decorations name the D3D register space and index of root UAVs;
-+ * they are rewritten here to this root signature's bindings, as dxil-spirv's remapping would
-+ * place them. Anything else (or a root UAV vkd3d does not lower to an SSBO) refuses, and the
-+ * DXIL is compiled as usual. */
++ * part of the DXBC container:
++ *   { u32 version (2); u32 workgroup[3]; u32 wave_size; u32 root_uav_mask; SPIR-V }
++ * Root UAVs u<k> (space 0, bit k of root_uav_mask) are read through buffer device addresses
++ * from push-constant member k. Other resources carry placeholder decorations, rewritten here
++ * with vkd3d's own remapping (dxil_remap_inner) as dxil-spirv's would be:
++ *   DescriptorSet 100, Binding c: the shader-visible heap, c = 0 sampled image, 1 storage
++ *     image, 2 raw SRV buffer, 3 raw UAV buffer, 4 sampler
++ *   DescriptorSet s < 100, Binding r: static sampler s<r>, space s
++ * Anything vkd3d would place otherwise (a root UAV not at root descriptor k, a heap with
++ * offsets) refuses, and the DXIL is compiled as usual. */
 +#define XCL_TAG_XSPV ((uint32_t)'X' | ((uint32_t)'S' << 8) | ((uint32_t)'P' << 16) | ((uint32_t)'V' << 24))
++#define XCL_XSPV_HEADER_WORDS 6
 +
 +static const uint32_t *xcl_find_xspv(const struct vkd3d_shader_code *dxbc, size_t *size)
 +{
@@ -29,7 +35,8 @@ index b22d8604..e9d7c72e 100644
 +            return NULL;
 +        memcpy(&tag, d + offset, 4);
 +        memcpy(&chunk_size, d + offset + 4, 4);
-+        if (tag == XCL_TAG_XSPV && offset + 8 + chunk_size <= dxbc->size && chunk_size >= 20 + 20 && !(chunk_size & 3))
++        if (tag == XCL_TAG_XSPV && offset + 8 + chunk_size <= dxbc->size &&
++                chunk_size >= 4 * (XCL_XSPV_HEADER_WORDS + 5) && !(chunk_size & 3))
 +        {
 +            *size = chunk_size;
 +            return (const uint32_t *)(d + offset + 8);
@@ -38,54 +45,128 @@ index b22d8604..e9d7c72e 100644
 +    return NULL;
 +}
 +
-+static bool xcl_remap_root_uav(const struct vkd3d_shader_interface_info *info, uint32_t space, uint32_t reg,
-+        uint32_t *set, uint32_t *binding)
++static void xcl_remap_init(struct vkd3d_dxil_remap_info *r, const struct vkd3d_shader_interface_info *info)
 +{
 +    unsigned int i;
 +
-+    if (!(info->flags & VKD3D_SHADER_INTERFACE_HEAP_LOWERING) || info->min_ssbo_alignment > 4)
-+        return false;
++    memset(r, 0, sizeof(*r));
++    r->bindings = info->bindings;
++    r->binding_count = info->binding_count;
++    r->descriptor_table_offset_words = info->descriptor_tables.offset / sizeof(uint32_t);
 +    for (i = 0; i < info->binding_count; i++)
++        if (vkd3d_shader_binding_is_root_descriptor(&info->bindings[i]))
++            r->num_root_descriptors++;
++    r->shader_interface_flags = info->flags;
++    r->min_ssbo_alignment = info->min_ssbo_alignment;
++}
++
++/* vkd3d's binding for a placeholder (set, binding) of the SPIR-V, false if it cannot be used */
++static bool xcl_remap(const struct vkd3d_dxil_remap_info *r, uint32_t set, uint32_t binding,
++        uint32_t *out_set, uint32_t *out_binding)
++{
++    enum vkd3d_shader_descriptor_type type;
++    struct dxil_spv_vulkan_binding vk;
++    struct dxil_spv_d3d_binding d3d;
++    uint32_t flags;
++
++    memset(&d3d, 0, sizeof(d3d));
++    memset(&vk, 0, sizeof(vk));
++    d3d.stage = DXIL_SPV_STAGE_COMPUTE;
++    if (set == VKD3D_SHADER_GLOBAL_HEAP_VIRTUAL_DESCRIPTOR_SET)
 +    {
-+        const struct vkd3d_shader_resource_binding *b = &info->bindings[i];
-+        if (b->type == VKD3D_SHADER_DESCRIPTOR_TYPE_UAV && b->register_space == space &&
-+                reg >= b->register_index && reg - b->register_index < b->register_count &&
-+                vkd3d_shader_binding_is_root_descriptor(b))
++        d3d.register_space = UINT32_MAX;
++        d3d.register_index = UINT32_MAX;
++        d3d.range_size = UINT32_MAX;
++        switch (binding)
 +        {
-+            *set = b->binding.set;
-+            *binding = b->binding.binding;
-+            return true;
++            case 0: type = VKD3D_SHADER_DESCRIPTOR_TYPE_SRV; d3d.kind = DXIL_SPV_RESOURCE_KIND_TEXTURE_2D; flags = VKD3D_SHADER_BINDING_FLAG_IMAGE; break;
++            case 1: type = VKD3D_SHADER_DESCRIPTOR_TYPE_UAV; d3d.kind = DXIL_SPV_RESOURCE_KIND_TEXTURE_2D; flags = VKD3D_SHADER_BINDING_FLAG_IMAGE; break;
++            case 2: type = VKD3D_SHADER_DESCRIPTOR_TYPE_SRV; d3d.kind = DXIL_SPV_RESOURCE_KIND_RAW_BUFFER; d3d.alignment = 16;
++                flags = VKD3D_SHADER_BINDING_FLAG_BUFFER | VKD3D_SHADER_BINDING_FLAG_RAW_SSBO; break;
++            case 3: type = VKD3D_SHADER_DESCRIPTOR_TYPE_UAV; d3d.kind = DXIL_SPV_RESOURCE_KIND_RAW_BUFFER; d3d.alignment = 16;
++                flags = VKD3D_SHADER_BINDING_FLAG_BUFFER | VKD3D_SHADER_BINDING_FLAG_RAW_SSBO; break;
++            case 4: type = VKD3D_SHADER_DESCRIPTOR_TYPE_SAMPLER; d3d.kind = DXIL_SPV_RESOURCE_KIND_SAMPLER; flags = 0; break;
++            default: return false;
 +        }
++        /* raw heap buffers whose descriptors carry offsets (SSBO offset buffer) are not handled */
++        if (binding >= 2 && binding <= 3 && (r->shader_interface_flags & VKD3D_SHADER_INTERFACE_SSBO_OFFSET_BUFFER))
++            return false;
++        if (!dxil_remap_inner(r, type, &d3d, &vk, flags))
++            return false;
++        if (!vk.bindless.use_heap || vk.bindless.heap_root_offset || vk.root_constant_index != UINT32_MAX)
++            return false;
 +    }
-+    return false;
++    else
++    {
++        d3d.register_space = set;
++        d3d.register_index = binding;
++        d3d.range_size = 1;
++        d3d.kind = DXIL_SPV_RESOURCE_KIND_SAMPLER;
++        if (!dxil_remap_inner(r, VKD3D_SHADER_DESCRIPTOR_TYPE_SAMPLER, &d3d, &vk, 0) || vk.bindless.use_heap)
++            return false;
++    }
++    *out_set = vk.set;
++    *out_binding = vk.binding;
++    return true;
++}
++
++/* Root UAV u<k>, space 0, must be read as a buffer device address from root descriptor k */
++static bool xcl_root_uav_is_bda(const struct vkd3d_dxil_remap_info *r, uint32_t k)
++{
++    struct dxil_spv_vulkan_binding vk;
++    struct dxil_spv_d3d_binding d3d;
++
++    memset(&d3d, 0, sizeof(d3d));
++    memset(&vk, 0, sizeof(vk));
++    d3d.stage = DXIL_SPV_STAGE_COMPUTE;
++    d3d.kind = DXIL_SPV_RESOURCE_KIND_RAW_BUFFER;
++    d3d.register_index = k;
++    d3d.range_size = 1;
++    d3d.alignment = 16;
++    if (!dxil_remap_inner(r, VKD3D_SHADER_DESCRIPTOR_TYPE_UAV, &d3d, &vk, VKD3D_SHADER_BINDING_FLAG_BUFFER))
++        return false;
++    return vk.descriptor_type == DXIL_SPV_VULKAN_DESCRIPTOR_TYPE_BUFFER_DEVICE_ADDRESS && vk.root_constant_index == k;
 +}
 +
 +static bool xcl_take_spirv(const struct vkd3d_shader_code *dxbc, struct vkd3d_shader_code *spirv,
 +        const struct vkd3d_shader_interface_info *info)
 +{
-+    uint32_t *words, set = 0, binding = 0, space, reg;
++    uint32_t *words, set = 0, binding = 0, space, reg, k;
++    struct vkd3d_dxil_remap_info remap;
 +    const uint32_t *part;
 +    size_t size, n, i, j;
 +
-+    if (info->stage != VK_SHADER_STAGE_COMPUTE_BIT || !(part = xcl_find_xspv(dxbc, &size)) || part[0] != 1)
++    part = xcl_find_xspv(dxbc, &size);
++    if (!part || info->stage != VK_SHADER_STAGE_COMPUTE_BIT)
 +        return false;
-+    n = (size - 20) / 4;
++    if (part[0] != 2)
++    {
++        WARN("XCL: XSPV version %u not supported.\n", part[0]);
++        return false;
++    }
++    xcl_remap_init(&remap, info);
++    for (k = 0; k < 32; k++)
++    {
++        if ((part[5] & (1u << k)) && !xcl_root_uav_is_bda(&remap, k))
++        {
++            WARN("XCL: XSPV refused: root UAV u%u is not root descriptor %u read by address.\n", k, k);
++            return false;
++        }
++    }
++    n = (size - 4 * XCL_XSPV_HEADER_WORDS) / 4;
 +    if (!(words = vkd3d_malloc(n * 4)))
 +        return false;
-+    memcpy(words, part + 5, n * 4);
++    memcpy(words, part + XCL_XSPV_HEADER_WORDS, n * 4);
 +    if (words[0] != 0x07230203)
 +        goto fail;
 +    /* decorations: DescriptorSet (34) and Binding (33) of the same target are rewritten together */
 +    for (i = 5; i < n; i += words[i] >> 16)
 +    {
-+        if ((words[i] >> 16) == 0)
++        if ((words[i] >> 16) == 0 || i + (words[i] >> 16) > n)
 +            goto fail;
-+        if ((words[i] & 0xffff) == 71 && (words[i] >> 16) == 4 && words[i + 2] == 34)
++        if ((words[i] & 0xffff) == 71 && (words[i] >> 16) == 4 && words[i + 2] == 34 && !(words[i + 3] & 0x80000000u))
 +        {
 +            space = words[i + 3];
-+            /* vkd3d's virtual sets (descriptor heap 100, …) are already final */
-+            if (space >= VKD3D_SHADER_GLOBAL_HEAP_VIRTUAL_DESCRIPTOR_SET && !(space & 0x80000000u))
-+                continue;
 +            reg = ~0u;
 +            for (j = 5; j < n; j += words[j] >> 16)
 +            {
@@ -94,14 +175,18 @@ index b22d8604..e9d7c72e 100644
 +                if ((words[j] & 0xffff) == 71 && (words[j] >> 16) == 4 && words[j + 1] == words[i + 1] && words[j + 2] == 33)
 +                    reg = words[j + 3];
 +            }
-+            if (reg == ~0u || !xcl_remap_root_uav(info, space, reg, &set, &binding))
++            if (reg == ~0u || !xcl_remap(&remap, space, reg, &set, &binding))
++            {
++                WARN("XCL: XSPV refused: no binding for placeholder set %u binding %u (interface flags %#x).\n",
++                        space, reg, info->flags);
 +                goto fail;
++            }
 +            for (j = 5; j < n; j += words[j] >> 16)
 +            {
 +                if ((words[j] & 0xffff) == 71 && (words[j] >> 16) == 4 && words[j + 1] == words[i + 1])
 +                {
 +                    if (words[j + 2] == 34)
-+                        words[j + 3] = set | 0x80000000u; /* marked: not read again as a register */
++                        words[j + 3] = set | 0x80000000u; /* marked: not read again as a placeholder */
 +                    else if (words[j + 2] == 33)
 +                        words[j + 3] = binding;
 +                }
@@ -111,6 +196,12 @@ index b22d8604..e9d7c72e 100644
 +    for (i = 5; i < n; i += words[i] >> 16)
 +        if ((words[i] & 0xffff) == 71 && (words[i] >> 16) == 4 && words[i + 2] == 34)
 +            words[i + 3] &= ~0x80000000u;
++    {
++        static uint32_t taken;
++        uint32_t c = vkd3d_atomic_uint32_increment(&taken, vkd3d_memory_order_relaxed);
++        if (c <= 4 || !(c % 100))
++            WARN("XCL: compute program #%u from the XSPV part (no dxil-spirv).\n", c);
++    }
 +    spirv->code = words;
 +    spirv->size = n * 4;
 +    spirv->meta.cs_workgroup_size[0] = part[1];
@@ -119,7 +210,6 @@ index b22d8604..e9d7c72e 100644
 +    spirv->meta.cs_wave_size_min = part[4];
 +    spirv->meta.cs_wave_size_max = part[4];
 +    spirv->meta.cs_wave_size_preferred = 0;
-+    INFO("XCL: compute shader %016"PRIx64" taken as SPIR-V (%zu words).\n", spirv->meta.hash, n);
 +    return true;
 +
 +fail:
@@ -130,7 +220,7 @@ index b22d8604..e9d7c72e 100644
  int vkd3d_shader_compile_dxil(const struct vkd3d_shader_code *dxbc,
          struct vkd3d_shader_code *spirv,
          struct vkd3d_shader_code_debug *spirv_debug,
-@@ -1537,6 +1658,14 @@ int vkd3d_shader_compile_dxil(const struct vkd3d_shader_code *dxbc,
+@@ -1537,6 +1748,14 @@ int vkd3d_shader_compile_dxil(const struct vkd3d_shader_code *dxbc,
          return ret;
      }
  

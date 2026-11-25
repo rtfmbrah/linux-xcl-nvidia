@@ -632,6 +632,11 @@ impl Lw {
         } else if limit > 0 && (numthreads == [32, 1, 1] || split_tid.is_some()) && hw == 32 {
             self.s.m.optimize();
             dispatch_chain = self.s.split_compute(numthreads, split_tid, limit).map(std::sync::Arc::new);
+            // the split wave64 form (32-lane waves, e.g. on NVIDIA) without a dispatch chain is
+            // one ordinary compute program
+            if dispatch_chain.is_none() && stage == Stage::Compute && crate::gpu::spirv::wanted() {
+                spirv = Some(crate::gpu::spirv::from_dxil::translate_compute(&self.s.m, numthreads));
+            }
             self.s.finish_optimized(numthreads, Some(hw))
         } else if stage == Stage::Compute && crate::gpu::spirv::wanted() {
             // the module as `try_finish` leaves it, translated before it is written as DXIL
@@ -652,8 +657,16 @@ impl Lw {
             }
         }
         // `XCL_SPIRV=1`: the SPIR-V rides along for the fork's vkd3d-proton build
+        if crate::gpu::spirv::live() {
+            if let Some(Err(e)) = &spirv {
+                crate::gpu::spirv::note_outcome(&format!("none: {e}"));
+            } else if spirv.is_none() {
+                crate::gpu::spirv::note_outcome(if dispatch_chain.is_some() { "none: split into a dispatch chain" } else { "none: not a compute program" });
+            }
+        }
         let c = match (&spirv, crate::gpu::spirv::live()) {
             (Some(Ok(words)), true) if crate::gpu::spirv::allowed(&c) => {
+                crate::gpu::spirv::note_outcome("SPIR-V attached");
                 super::container::with_part(&c, *b"XSPV", &crate::gpu::spirv::xspv_part(numthreads, hw, words)).unwrap_or(c)
             }
             _ => c,

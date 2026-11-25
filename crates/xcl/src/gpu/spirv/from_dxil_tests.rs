@@ -337,3 +337,41 @@ fn loop_exit_into_other_arm() {
     s.raw_store(output, off, &[r]);
     finish(s, "loop_exit_other_arm");
 }
+
+/// Textures and samplers from the heaps and a static sampler:
+///   t = Texture2D<float4> heap[3], u = RWTexture2D<float4> heap[4], b = Texture1D<uint4> heap[5],
+///   s = SamplerState heap[0], ss = static sampler s0 space1;
+///   u[id] = t.Load(id) + t.SampleLevel(s, uv, 0) + t.GatherRed(ss, uv) + float(b.Load(x).x + dims(t).x)
+#[test]
+fn heap_textures() {
+    use crate::gpu::dxil::ops::{CompType, TexKind};
+    let mut s = Shader::new(Stage::Compute, (6, 6));
+    let x = s.thread_id(0);
+    let y = s.thread_id(1);
+    let (i3, i4, i5, i0) = (s.m.i32c(3), s.m.i32c(4), s.m.i32c(5), s.m.i32c(0));
+    let t = s.heap_texture(i3, TexKind::D2, false, CompType::F32, 4, false);
+    let u = s.heap_texture(i4, TexKind::D2, true, CompType::F32, 4, false);
+    let b = s.heap_texture(i5, TexKind::D1, false, CompType::U32, 4, true);
+    let smp = s.heap_sampler(i0, false, false);
+    let ss = s.sampler(0, 1, false);
+    let l = s.texture_load(t, Some(i0), &[x, y], &[]);
+    let f32 = s.m.f32();
+    let fx = s.m.cast(crate::gpu::dxil::module::CastOp::UIToFP, x, f32);
+    let fy = s.m.cast(crate::gpu::dxil::module::CastOp::UIToFP, y, f32);
+    let zero = s.m.f32c(0);
+    let sl = s.sample_level(t, smp, &[fx, fy], &[], zero);
+    let g = s.gather(t, ss, &[fx, fy], &[], 0);
+    let bl = s.texture_load(b, Some(i0), &[x], &[]);
+    let dims = s.get_dimensions(t.handle, Some(i0));
+    let w = s.m.extract(dims, 0);
+    let sum = s.m.bin(BinOp::Add, bl[0], w);
+    let fs = s.m.cast(crate::gpu::dxil::module::CastOp::UIToFP, sum, f32);
+    let mut out = [l[0]; 4];
+    for k in 0..4 {
+        let a = s.m.bin(BinOp::Add, l[k], sl[k]);
+        let a = s.m.bin(BinOp::Add, a, g[k]);
+        out[k] = s.m.bin(BinOp::Add, a, fs);
+    }
+    s.texture_store(u, &[x, y], out);
+    finish(s, "heap_textures");
+}

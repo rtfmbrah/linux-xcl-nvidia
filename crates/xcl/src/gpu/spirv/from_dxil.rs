@@ -30,6 +30,8 @@ const SC_WORKGROUP: u32 = 4;
 const SC_PRIVATE: u32 = 6;
 const SC_FUNCTION: u32 = 7;
 const SC_STORAGE_BUFFER: u32 = 12;
+const SC_PUSH_CONSTANT: u32 = 9;
+const SC_PHYSICAL_STORAGE_BUFFER: u32 = 5349;
 const DEC_BLOCK: u32 = 2;
 const DEC_ARRAY_STRIDE: u32 = 6;
 const DEC_BUILTIN: u32 = 11;
@@ -67,9 +69,33 @@ enum Val {
     /// `createHandleFromHeap(index, sampler, nonuniform)`: the index id; not usable before
     /// `annotateHandle` says its kind
     HeapHandle(bool, u32, bool),
+    /// a texture handle: the loaded image id and its entry in `Tx::images`
+    Image(u32, u32),
+    /// a sampler handle: the loaded sampler id
+    Sampler(u32),
+    /// a texture op's `ResRet` / `getDimensions` struct: the `vec4` id and its component type
+    Vec4(u32, u32),
     /// a value with no use in SPIR-V (dx.types constants, `void` results)
     None,
 }
+
+/// A texture handle's image type and where it was loaded from.
+#[derive(Clone, Copy)]
+struct ImageInfo {
+    /// SPIR-V `Dim`: 0 1D, 1 2D, 2 3D, 3 Cube
+    dim: u32,
+    arrayed: bool,
+    /// a UAV (storage image)
+    storage: bool,
+    /// sampled type: 0 float, 1 int, 2 uint
+    kind: u8,
+    /// heap index id and whether it is non-uniform
+    index: u32,
+    nonuniform: bool,
+}
+
+#[path = "image.rs"]
+mod image;
 
 struct Tx<'a> {
     m: &'a Module,
@@ -94,6 +120,14 @@ struct Tx<'a> {
     buffer_base: HashMap<u32, (u32, bool)>,
     /// heap buffer variable → its element (block) type
     heap_blocks: HashMap<u32, u32>,
+    /// texture handles (`Val::Image`)
+    images: Vec<ImageInfo>,
+    /// the push-constant block of root descriptors (its id, declared at the end)
+    push_var: Option<u32>,
+    /// root UAVs read (bit k: `u<k>`)
+    root_uavs: u32,
+    /// blocks read through buffer device addresses
+    psb_blocks: std::collections::HashSet<u32>,
     /// node being emitted (for `subst`)
     cur: usize,
     subst: Vec<(Vec<bool>, usize, u32)>,
@@ -260,26 +294,60 @@ impl<'a> Tx<'a> {
         }
     }
 
-    /// The `StorageBuffer` variable of raw UAV `u<lower>, space<space>` (`uint data[]`).
-    fn buffer(&mut self, space: u32, lower: u32) -> u32 {
-        if let Some(&v) = self.buffers.get(&(space, lower)) {
-            return v;
+    /// Raw UAV `u<lower>, space 0` (a root UAV of XCL's root signature): read through its
+    /// buffer device address, which vkd3d-proton keeps in push-constant member `lower` (root
+    /// descriptor `lower`) when it does not lower root descriptors to SSBOs. A pointer to a
+    /// `uint data[]` block of its own (`NonWritable` / `NonReadable` go on its member).
+    fn root_buffer(&mut self, space: u32, lower: u32) -> Result<u32, String> {
+        if space != 0 || lower >= 16 {
+            return err(format!("root UAV u{lower} in space {space}"));
         }
+        self.root_uavs |= 1 << lower;
         let u = self.uint();
-        let arr = self.w.ty(op::TYPE_RUNTIME_ARRAY, &[u]);
-        if !self.w_has_stride(arr) {
-            self.w.decorate(arr, DEC_ARRAY_STRIDE, &[4]);
+        let uv2 = self.w.vector(u, 2);
+        let push = match self.push_var {
+            Some(v) => v,
+            None => {
+                let v = self.w.id();
+                self.push_var = Some(v);
+                v
+            }
+        };
+        let st = match self.buffers.get(&(0x7000_0000, lower)) {
+            Some(&st) => st,
+            None => {
+                let arr = self.w.ty(op::TYPE_RUNTIME_ARRAY, &[u]);
+                if !self.w_has_stride(arr) {
+                    self.w.decorate(arr, DEC_ARRAY_STRIDE, &[4]);
+                }
+                let st = self.w.distinct_type(op::TYPE_STRUCT, &[arr]);
+                self.w.decorate(st, DEC_BLOCK, &[]);
+                self.w.member_decorate(st, 0, DEC_OFFSET, &[0]);
+                self.buffers.insert((0x7000_0000, lower), st);
+                self.psb_blocks.insert(st);
+                st
+            }
+        };
+        let ppc = self.w.pointer(SC_PUSH_CONSTANT, uv2);
+        let k = self.w.constant_u32(lower);
+        let p = self.w.id();
+        self.emit(op::ACCESS_CHAIN, &[ppc, p, push, k]);
+        let addr = self.w.id();
+        self.emit(op::LOAD, &[uv2, addr, p]);
+        let pst = self.w.pointer(SC_PHYSICAL_STORAGE_BUFFER, st);
+        let r = self.w.id();
+        self.emit(124, &[pst, r, addr]); // OpBitcast
+        self.buffer_base.insert(r, (st, false));
+        Ok(r)
+    }
+
+    /// Memory operands of a load / store through a word pointer of `buf` (`Aligned 4` for
+    /// buffer device addresses).
+    fn word_access(&self, buf: u32) -> &'static [u32] {
+        match self.buffer_base.get(&buf) {
+            Some((b, _)) if self.psb_blocks.contains(b) => &[2, 4],
+            _ => &[],
         }
-        let st = self.w.distinct_type(op::TYPE_STRUCT, &[arr]);
-        self.w.decorate(st, DEC_BLOCK, &[]);
-        self.w.member_decorate(st, 0, DEC_OFFSET, &[0]);
-        let p = self.w.pointer(SC_STORAGE_BUFFER, st);
-        let var = self.w.global_variable(p, SC_STORAGE_BUFFER);
-        self.w.decorate(var, DEC_DESCRIPTOR_SET, &[space]);
-        self.w.decorate(var, DEC_BINDING, &[lower]);
-        self.buffers.insert((space, lower), var);
-        self.interface.push(var);
-        var
     }
 
     /// The heap's raw buffers (`ResourceDescriptorHeap[i]` as `(RW)ByteAddressBuffer`, SRVs
@@ -303,7 +371,7 @@ impl<'a> Tx<'a> {
         let p = self.w.pointer(SC_STORAGE_BUFFER, heap);
         let var = self.w.global_variable(p, SC_STORAGE_BUFFER);
         self.w.decorate(var, DEC_DESCRIPTOR_SET, &[VKD3D_HEAP_SET]);
-        self.w.decorate(var, DEC_BINDING, &[0]);
+        self.w.decorate(var, DEC_BINDING, &[if uav { 3 } else { 2 }]);
         self.buffers.insert(key, var);
         self.heap_blocks.insert(var, st);
         self.interface.push(var);
@@ -326,7 +394,8 @@ impl<'a> Tx<'a> {
         let (var, nonuniform) = self.buffer_base.get(&buf).copied().unwrap_or((buf, false));
         *self.buffer_access.entry(var).or_default() |= access;
         let u = self.uint();
-        let p = self.w.pointer(SC_STORAGE_BUFFER, u);
+        let sc = if self.psb_blocks.contains(&var) { SC_PHYSICAL_STORAGE_BUFFER } else { SC_STORAGE_BUFFER };
+        let p = self.w.pointer(sc, u);
         let zero = self.w.constant_u32(0);
         let r = self.w.id();
         self.emit(op::ACCESS_CHAIN, &[p, r, buf, zero, index]);
@@ -365,16 +434,21 @@ impl<'a> Tx<'a> {
                 let Value::Const(b) = a[0] else { return err("createHandleFromBinding: binding not constant") };
                 let ConstDef::Aggregate(_, parts) = self.m.const_def(b).clone() else { return err("createHandleFromBinding: binding not a struct") };
                 let class = self.m.const_u64(parts[3]).unwrap_or(0);
+                if class == 3 {
+                    // a static sampler
+                    let space = self.m.const_u64(parts[2]).unwrap_or(0) as u32;
+                    return Ok(self.sampler(None, (space, c(self, 1)?)));
+                }
                 if class != 1 {
                     return err(format!("createHandleFromBinding: resource class {class} (only UAVs)"));
                 }
                 let (lower, space) = (self.m.const_u64(parts[0]).unwrap_or(0) as u32, self.m.const_u64(parts[2]).unwrap_or(0) as u32);
                 let index = c(self, 1)?;
-                Val::Buffer(self.buffer(space, index.max(lower)))
+                Val::Buffer(self.root_buffer(space, index.max(lower))?)
             }
             216 => match self.vals.get(&a[0]) {
                 // annotateHandle: the handle itself
-                Some(&v @ Val::Buffer(_)) => v,
+                Some(&v @ (Val::Buffer(_) | Val::Sampler(_))) => v,
                 Some(&Val::HeapHandle(sampler, index, nonuniform)) => {
                     // resource properties: kind (bits 0-7), UAV (bit 12); dword 1: format / stride
                     let props = match a[1] {
@@ -386,6 +460,12 @@ impl<'a> Tx<'a> {
                     };
                     let p0 = props.first().copied().unwrap_or(0);
                     let kind = p0 & 0xff;
+                    if sampler && kind == 14 {
+                        return Ok(self.sampler(Some((index, nonuniform)), (0, 0)));
+                    }
+                    if !sampler && kind != 11 && kind != 12 && kind != 13 {
+                        return self.heap_texture(kind, p0 & 0x1000 != 0, props.get(1).copied().unwrap_or(0) & 0xff, index, nonuniform);
+                    }
                     if !sampler && kind == 11 {
                         let var = self.heap_buffers(p0 & 0x1000 != 0);
                         let st = self.heap_blocks[&var];
@@ -442,7 +522,9 @@ impl<'a> Tx<'a> {
                         self.op2(128, u, base, kk)
                     };
                     let p = self.buffer_word(buf, idx, 2);
-                    self.emit(op::STORE, &[p, v]);
+                    let mut ops = vec![p, v];
+                    ops.extend_from_slice(self.word_access(buf));
+                    self.emit(op::STORE, &ops);
                 }
                 Val::None
             }
@@ -528,6 +610,8 @@ impl<'a> Tx<'a> {
                     Val::Id(self.cmpxchg(t, p, new, cmp, 1, sem))
                 }
             }
+            62 | 63 | 65 | 66 | 67 | 72 | 73 => return self.texture_op(opcode, a),
+            71 => Val::Id(self.w.constant_bool(true)), // checkAccessFullyMapped
             _ => return self.math_op(inst, opcode, name, a),
         })
     }
@@ -970,10 +1054,21 @@ impl<'a> Tx<'a> {
                     };
                     let p = self.buffer_word(buf, index, 1);
                     let r = self.w.id();
-                    self.emit(op::LOAD, &[u, r, p]);
+                    let mut ops = vec![u, r, p];
+                    ops.extend_from_slice(self.word_access(buf));
+                    self.emit(op::LOAD, &ops);
                     Val::Id(r)
                 }
                 Some(Val::Pair(x, y)) => Val::Id(if idx == 0 { x } else { y }),
+                Some(Val::Vec4(v, comp)) => {
+                    if idx >= 4 {
+                        Val::Id(self.w.constant_u32(0)) // the status word of a ResRet
+                    } else {
+                        let r = self.w.id();
+                        self.emit(op::COMPOSITE_EXTRACT, &[comp, r, v, idx]);
+                        Val::Id(r)
+                    }
+                }
                 Some(Val::Ballot(b)) => {
                     let u = self.uint();
                     let r = self.w.id();
@@ -1933,6 +2028,10 @@ pub fn translate_compute(m: &Module, numthreads: [u32; 3]) -> Result<Vec<u32>, S
         buffer_access: HashMap::new(),
         buffer_base: HashMap::new(),
         heap_blocks: HashMap::new(),
+        images: Vec::new(),
+        push_var: None,
+        root_uavs: 0,
+        psb_blocks: Default::default(),
         cur: 0,
         subst: Vec::new(),
         synth_ids: HashMap::new(),
@@ -2088,11 +2187,30 @@ pub fn translate_compute(m: &Module, numthreads: [u32; 3]) -> Result<Vec<u32>, S
     let mut acc: Vec<(u32, u8)> = tx.buffer_access.iter().map(|(&b, &a)| (b, a)).collect();
     acc.sort_unstable();
     for (var, a) in acc {
-        match a {
-            1 => tx.w.decorate(var, 24, &[]), // NonWritable
-            2 => tx.w.decorate(var, 25, &[]), // NonReadable
-            _ => {}
+        let d = match a {
+            1 => 24, // NonWritable
+            2 => 25, // NonReadable
+            _ => continue,
+        };
+        if tx.psb_blocks.contains(&var) {
+            tx.w.member_decorate(var, 0, d, &[]);
+        } else {
+            tx.w.decorate(var, d, &[]);
         }
+    }
+    // the root descriptors' push constants: one buffer address (uvec2) per root UAV read
+    if let Some(push) = tx.push_var {
+        let n = 32 - tx.root_uavs.leading_zeros();
+        let u = tx.uint();
+        let uv2 = tx.w.vector(u, 2);
+        let st = tx.w.distinct_type(op::TYPE_STRUCT, &vec![uv2; n as usize]);
+        tx.w.decorate(st, DEC_BLOCK, &[]);
+        for i in 0..n {
+            tx.w.member_decorate(st, i, DEC_OFFSET, &[8 * i]);
+        }
+        let pt = tx.w.pointer(SC_PUSH_CONSTANT, st);
+        tx.w.emit(Section::Globals, op::VARIABLE, &[pt, push, SC_PUSH_CONSTANT]);
+        tx.interface.push(push);
     }
 
     // the function: header, the locals at the top of the first block, the body
@@ -2117,11 +2235,20 @@ pub fn translate_compute(m: &Module, numthreads: [u32; 3]) -> Result<Vec<u32>, S
     // the Vulkan memory model (as dxil-spirv): NVIDIA's compiler builds the same program
     // markedly faster than under GLSL450 (measured on GTA VI compute programs)
     tx.w.capability(5345); // VulkanMemoryModel
-    tx.w.emit(Section::MemoryModel, op::MEMORY_MODEL, &[0, 3]); // Logical Vulkan
+    if tx.psb_blocks.is_empty() {
+        tx.w.emit(Section::MemoryModel, op::MEMORY_MODEL, &[0, 3]); // Logical Vulkan
+    } else {
+        tx.w.capability(5347); // PhysicalStorageBufferAddresses
+        tx.w.emit(Section::MemoryModel, op::MEMORY_MODEL, &[5348, 3]); // PhysicalStorageBuffer64 Vulkan
+    }
     let mut ep = vec![5, main]; // GLCompute
     ep.extend(Writer::string("main"));
     ep.extend(tx.interface.iter().copied());
     tx.w.emit(Section::EntryPoints, op::ENTRY_POINT, &ep);
     tx.w.emit(Section::ExecutionModes, op::EXECUTION_MODE, &[main, 17, numthreads[0], numthreads[1], numthreads[2]]);
-    Ok(tx.w.finish())
+    let root_uavs = tx.root_uavs;
+    let mut words = tx.w.finish();
+    // the generator word carries the root UAVs read (for the `XSPV` header)
+    words[2] = 0x5843_0000 | root_uavs;
+    Ok(words)
 }
