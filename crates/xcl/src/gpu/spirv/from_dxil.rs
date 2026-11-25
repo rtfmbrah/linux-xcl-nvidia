@@ -77,6 +77,8 @@ struct Tx<'a> {
     pending_phis: Vec<(usize, usize, u32)>,
     /// storage class of pointer values whose class is not their DXIL address space's
     ptr_sc: HashMap<Value, u32>,
+    /// buffer variable → accesses seen (1 read, 2 write)
+    buffer_access: HashMap<u32, u8>,
 }
 
 fn err<T>(msg: impl Into<String>) -> Result<T, String> {
@@ -266,7 +268,9 @@ impl<'a> Tx<'a> {
     }
 
     /// Pointer to word `index` of a buffer.
-    fn buffer_word(&mut self, buf: u32, index: u32) -> u32 {
+    /// `access`: 1 read, 2 write, 3 both (atomics); recorded for `NonWritable` / `NonReadable`.
+    fn buffer_word(&mut self, buf: u32, index: u32, access: u8) -> u32 {
+        *self.buffer_access.entry(buf).or_default() |= access;
         let u = self.uint();
         let p = self.w.pointer(SC_STORAGE_BUFFER, u);
         let zero = self.w.constant_u32(0);
@@ -328,13 +332,20 @@ impl<'a> Tx<'a> {
                 let Some(&Val::Buffer(buf)) = self.vals.get(&a[0]) else { return err("rawBufferStore to an unsupported handle") };
                 let mask = c(self, 7)?;
                 let off = self.id(a[1])?;
+                let base = self.word_index(off, 0);
+                let u = self.uint();
                 for k in 0..4 {
                     if mask & (1 << k) == 0 {
                         continue;
                     }
                     let v = self.id(a[3 + k])?;
-                    let idx = self.word_index(off, k as u32);
-                    let p = self.buffer_word(buf, idx);
+                    let idx = if k == 0 {
+                        base
+                    } else {
+                        let kk = self.w.constant_u32(k as u32);
+                        self.op2(128, u, base, kk)
+                    };
+                    let p = self.buffer_word(buf, idx, 2);
                     self.emit(op::STORE, &[p, v]);
                 }
                 Val::None
@@ -395,7 +406,7 @@ impl<'a> Tx<'a> {
                 let off_at = if opcode == 78 { 2 } else { 1 };
                 let off = self.id(a[off_at])?;
                 let idx = self.word_index(off, 0);
-                let p = self.buffer_word(buf, idx);
+                let p = self.buffer_word(buf, idx, 3);
                 let sem = SEM_ACQUIRE_RELEASE | SEM_UNIFORM_MEMORY;
                 if opcode == 78 {
                     let x = self.id(a[5])?;
@@ -851,7 +862,7 @@ impl<'a> Tx<'a> {
                         self.emit(128, &[u, s, word, k]);
                         s
                     };
-                    let p = self.buffer_word(buf, index);
+                    let p = self.buffer_word(buf, index, 1);
                     let r = self.w.id();
                     self.emit(op::LOAD, &[u, r, p]);
                     Val::Id(r)
@@ -1364,6 +1375,7 @@ pub fn translate_compute(m: &Module, numthreads: [u32; 3]) -> Result<Vec<u32>, S
         body: Vec::new(),
         pending_phis: Vec::new(),
         ptr_sc: HashMap::new(),
+        buffer_access: HashMap::new(),
     };
     tx.w.capability(CAP_SHADER);
     tx.labels = (0..st.succ.len()).map(|_| tx.w.id()).collect();
@@ -1494,6 +1506,18 @@ pub fn translate_compute(m: &Module, numthreads: [u32; 3]) -> Result<Vec<u32>, S
             };
             tx.body[at + 2 + 2 * k] = id;
             tx.body[at + 3 + 2 * k] = tx.labels[from];
+        }
+    }
+
+    // buffers only read / only written: drivers need not order the others' accesses against
+    // them (dxil-spirv does the same; NVIDIA's compiler builds such programs much faster)
+    let mut acc: Vec<(u32, u8)> = tx.buffer_access.iter().map(|(&b, &a)| (b, a)).collect();
+    acc.sort_unstable();
+    for (var, a) in acc {
+        match a {
+            1 => tx.w.decorate(var, 24, &[]), // NonWritable
+            2 => tx.w.decorate(var, 25, &[]), // NonReadable
+            _ => {}
         }
     }
 
