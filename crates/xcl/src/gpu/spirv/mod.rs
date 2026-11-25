@@ -23,6 +23,22 @@ pub fn live() -> bool {
     *ON.get_or_init(|| std::env::var("XCL_SPIRV").is_ok_and(|v| v.trim() == "1"))
 }
 
+/// `XCL_SPIRV_ALLOW=<file>`: only programs whose DXIL container (FNV-1a 64 of its bytes, hex,
+/// one per line) is listed carry SPIR-V – those whose SPIR-V passed `spirv-val` offline
+/// (`xcl shaders --direct --spirv --dump`). NVIDIA's compiler crashes on invalid SPIR-V instead
+/// of refusing it. Unset: every translated program carries it.
+pub fn allowed(dxil: &[u8]) -> bool {
+    static LIST: std::sync::OnceLock<Option<std::collections::HashSet<u64>>> = std::sync::OnceLock::new();
+    let list = LIST.get_or_init(|| {
+        let path = std::env::var("XCL_SPIRV_ALLOW").ok()?;
+        let text = std::fs::read_to_string(&path).map_err(|e| crate::xlog_warn!("XCL_SPIRV_ALLOW {path}: {e}")).ok()?;
+        let set: std::collections::HashSet<u64> = text.lines().filter_map(|l| u64::from_str_radix(l.trim(), 16).ok()).collect();
+        crate::xlog_info!("SPIR-V: {} programs allowed ({path})", set.len());
+        Some(set)
+    });
+    list.as_ref().is_none_or(|l| l.contains(&crate::gpu::shader::fnv64(dxil)))
+}
+
 /// The `XSPV` part: version 1, the workgroup size, the wave size, then the SPIR-V words.
 pub fn xspv_part(numthreads: [u32; 3], wave: u32, words: &[u32]) -> Vec<u8> {
     [1, numthreads[0], numthreads[1], numthreads[2], wave].iter().chain(words).flat_map(|w| w.to_le_bytes()).collect()

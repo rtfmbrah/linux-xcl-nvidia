@@ -57,6 +57,8 @@ enum Val {
     Ballot(u32),
     /// a two-result op (`dx.types.twoi32`, `i32c`, `splitDouble`): the two values
     Pair(u32, u32),
+    /// `createHandleFromHeap(index, sampler)`: not usable before `annotateHandle` says its kind
+    HeapHandle(bool),
     /// a value with no use in SPIR-V (dx.types constants, `void` results)
     None,
 }
@@ -328,8 +330,30 @@ impl<'a> Tx<'a> {
             216 => match self.vals.get(&a[0]) {
                 // annotateHandle: the handle itself
                 Some(&v @ Val::Buffer(_)) => v,
+                Some(&Val::HeapHandle(sampler)) => {
+                    // resource properties: kind (bits 0-7), UAV (bit 12); dword 1: format / stride
+                    let props = match a[1] {
+                        Value::Const(c) => match self.m.const_def(c).clone() {
+                            ConstDef::Aggregate(_, parts) => parts.iter().map(|&p| self.m.const_u64(p).unwrap_or(0) as u32).collect::<Vec<_>>(),
+                            _ => vec![],
+                        },
+                        _ => vec![],
+                    };
+                    let p0 = props.first().copied().unwrap_or(0);
+                    return err(format!(
+                        "heap {} kind {} {}",
+                        if sampler { "sampler" } else if p0 & 0x1000 != 0 { "UAV" } else { "SRV" },
+                        p0 & 0xff,
+                        if p0 & 0xff == 11 { "(raw buffer)" } else { "" }
+                    ));
+                }
                 _ => return err("annotateHandle of an unsupported handle"),
             },
+            218 => {
+                // createHandleFromHeap(index, sampler, nonuniform)
+                let sampler = c(self, 1)? != 0;
+                Val::HeapHandle(sampler)
+            }
             139 => {
                 // rawBufferLoad(handle, offset, undef, mask, align): components read on extract
                 let Some(&Val::Buffer(buf)) = self.vals.get(&a[0]) else { return err("rawBufferLoad from an unsupported handle") };
