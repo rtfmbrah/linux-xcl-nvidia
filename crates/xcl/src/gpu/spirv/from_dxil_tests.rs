@@ -216,3 +216,50 @@ fn loop_header_with_switch() {
     s.raw_store(output, off, &[acc2]);
     finish(s, "loop_switch");
 }
+
+/// A join of both arms that one arm can skip (LLVM tail merging):
+///   if (tid < 32) { v = in[tid] * 3 } else { if (tid & 1) { r = 9; goto end } v = tid + 100 }
+///   r = v ^ 5; end: out[tid] = r
+#[test]
+fn partial_join() {
+    let mut s = Shader::new(Stage::Compute, (6, 6));
+    let input = s.raw_uav(0, 0);
+    let output = s.raw_uav(1, 0);
+    let tid = s.thread_id(0);
+    let four = s.m.i32c(4);
+    let off = s.m.bin(BinOp::Mul, tid, four);
+    let (arm_a, arm_b, arm_c, join, end) = (s.m.new_block(), s.m.new_block(), s.m.new_block(), s.m.new_block(), s.m.new_block());
+    let lim = s.m.i32c(32);
+    let c = s.m.cmp(Pred::ULt, tid, lim);
+    s.m.cond_br(c, arm_a, arm_b);
+    s.m.set_block(arm_a);
+    let x = s.raw_load(input, off, 1)[0];
+    let three = s.m.i32c(3);
+    let a = s.m.bin(BinOp::Mul, x, three);
+    s.m.br(join);
+    s.m.set_block(arm_b);
+    let one = s.m.i32c(1);
+    let zero = s.m.i32c(0);
+    let odd = s.m.bin(BinOp::And, tid, one);
+    let skip = s.m.cmp(Pred::Ne, odd, zero);
+    s.m.cond_br(skip, end, arm_c);
+    s.m.set_block(arm_c);
+    let hundred = s.m.i32c(100);
+    let b = s.m.bin(BinOp::Add, tid, hundred);
+    s.m.br(join);
+    s.m.set_block(join);
+    let i32 = s.m.i32();
+    let v = s.m.phi(i32);
+    s.m.add_incoming(v, a, arm_a);
+    s.m.add_incoming(v, b, arm_c);
+    let five = s.m.i32c(5);
+    let x5 = s.m.bin(BinOp::Xor, v, five);
+    s.m.br(end);
+    s.m.set_block(end);
+    let r = s.m.phi(i32);
+    let nine = s.m.i32c(9);
+    s.m.add_incoming(r, x5, join);
+    s.m.add_incoming(r, nine, arm_b);
+    s.raw_store(output, off, &[r]);
+    finish(s, "partial_join");
+}

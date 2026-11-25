@@ -1343,6 +1343,7 @@ fn structure(m: &Module) -> Result<Structure, String> {
             break;
         }
     }
+    ladder_partial_joins(&mut succ, &mut phis, &mut switches);
     let n = succ.len();
     let (back, post) = dfs(&succ);
     let is_back = |b: usize, s: usize| back.contains(&(b, s));
@@ -1560,6 +1561,172 @@ fn structure(m: &Module) -> Result<Structure, String> {
     }
     let selections = sel_headers.iter().map(|&h| (h, merge_of[&h])).collect();
     Ok(Structure { order, succ: vsucc, phis, loops: loops_out, selections, split, switches, subst })
+}
+
+/// A join `t` of a selection's arms that is not the selection's merge `M`: some path from the
+/// header `A = idom(t)` reaches `M` without passing `t`, as in
+/// `if (a) { X } else { Y; if (b) goto end; Z } T; end:` (LLVM's tail merging makes these).
+/// SPIR-V constructs cannot branch into another arm, so the edges into `t` and the edges into
+/// `M` from outside `t`'s region all go to one new node instead, which switches on a selector
+/// phi to `t` or `M` (and carries their phis); it becomes the merge of the selection.
+/// Only joins whose region `t` is entered through `t` alone and that sit with `A` and `M` in
+/// the same loop are rewritten; the others stay for `spirv-val` to refuse.
+fn ladder_partial_joins(succ: &mut Vec<Vec<usize>>, phis: &mut Vec<Vec<(u32, Vec<(PhiIn, usize)>)>>, switches: &mut HashMap<usize, u32>) {
+    for _ in 0..1024 {
+        let n = succ.len();
+        let (back, _) = dfs(succ);
+        let back: std::collections::HashSet<(usize, usize)> = back.into_iter().collect();
+        let fwd: Vec<Vec<usize>> = (0..n).map(|b| succ[b].iter().copied().filter(|&s| !back.contains(&(b, s))).collect()).collect();
+        let mut preds: Vec<Vec<usize>> = vec![Vec::new(); n];
+        for b in 0..n {
+            for &s in &fwd[b] {
+                if !preds[s].contains(&b) {
+                    preds[s].push(b);
+                }
+            }
+        }
+        // innermost loop of every node; loop headers, latches and exit targets are left alone
+        let mut loop_of = vec![usize::MAX; n];
+        let mut size = vec![usize::MAX; n];
+        let mut special = vec![false; n];
+        let mut all_preds: Vec<Vec<usize>> = vec![Vec::new(); n];
+        for b in 0..n {
+            for &s in &succ[b] {
+                all_preds[s].push(b);
+            }
+        }
+        let mut headers: Vec<usize> = back.iter().map(|e| e.1).collect();
+        headers.sort_unstable();
+        headers.dedup();
+        for &h in &headers {
+            let mut body = vec![false; n];
+            body[h] = true;
+            let mut work: Vec<usize> = back.iter().filter(|e| e.1 == h).map(|e| e.0).collect();
+            while let Some(x) = work.pop() {
+                if !body[x] {
+                    body[x] = true;
+                    work.extend(all_preds[x].iter().copied());
+                }
+            }
+            let count = body.iter().filter(|&&x| x).count();
+            for x in 0..n {
+                if body[x] {
+                    if count < size[x] {
+                        size[x] = count;
+                        loop_of[x] = h;
+                    }
+                    for &s in &succ[x] {
+                        if !body[s] {
+                            special[s] = true;
+                        }
+                    }
+                }
+            }
+            special[h] = true;
+        }
+        for e in &back {
+            special[e.0] = true;
+        }
+        let idom = dominator_tree(succ);
+        let ipdom = post_dominator_tree(&fwd);
+        let dominates = |a: usize, mut x: usize| loop {
+            if x == a {
+                return true;
+            }
+            if x == 0 || idom[x] == usize::MAX || idom[x] == x {
+                return false;
+            }
+            x = idom[x];
+        };
+        let mut done = false;
+        for t in 0..n {
+            if preds[t].len() < 2 || special[t] || idom[t] == usize::MAX {
+                continue;
+            }
+            let a = idom[t];
+            let mm = ipdom[a];
+            if mm >= n || mm == t || special[a] || loop_of[a] != loop_of[t] || loop_of[mm] != loop_of[t] {
+                continue;
+            }
+            // t's region: everything reached from t before M; entered through t only
+            let mut cut = vec![false; n];
+            let mut work = vec![t];
+            while let Some(x) = work.pop() {
+                if x != mm && !cut[x] {
+                    cut[x] = true;
+                    work.extend(fwd[x].iter().copied());
+                }
+            }
+            if (0..n).any(|c| cut[c] && c != t && preds[c].iter().any(|&p| !cut[p])) {
+                continue;
+            }
+            let from_t = preds[t].clone();
+            let from_m: Vec<usize> = preds[mm].iter().copied().filter(|&p| !cut[p] && dominates(a, p)).collect();
+            if from_m.is_empty() || from_t.iter().any(|p| from_m.contains(p)) {
+                continue;
+            }
+            if phis[t].iter().any(|(o, _)| phis[mm].iter().any(|(o2, _)| o == o2)) {
+                continue;
+            }
+            let j = succ.len();
+            let key = SELECTOR + switches.len() as u32;
+            succ.push(vec![t, mm]);
+            phis.push(Vec::new());
+            let from: Vec<(usize, usize)> = from_t.iter().map(|&p| (p, 0)).chain(from_m.iter().map(|&p| (p, 1))).collect();
+            phis[j].push((key, from.iter().map(|&(p, k)| (PhiIn::Lit(k as u32), p)).collect()));
+            for (k, target) in [t, mm].into_iter().enumerate() {
+                let mut moved = Vec::new();
+                for (orig, list) in phis[target].iter_mut() {
+                    let (take, keep): (Vec<_>, Vec<_>) = list.drain(..).partition(|e| from.iter().any(|f| f.0 == e.1 && f.1 == k));
+                    *list = keep;
+                    list.push((PhiIn::Synth(j, *orig), j));
+                    moved.push((*orig, take));
+                }
+                for (orig, take) in moved {
+                    let entries = from.iter().map(|&(p, _)| (take.iter().find(|e| e.1 == p).map_or(PhiIn::Undef, |e| e.0), p)).collect();
+                    phis[j].push((orig, entries));
+                }
+            }
+            for &(p, k) in &from {
+                let target = if k == 0 { t } else { mm };
+                for s in succ[p].iter_mut() {
+                    if *s == target {
+                        *s = j;
+                    }
+                }
+            }
+            switches.insert(j, key);
+            done = true;
+            break;
+        }
+        if !done {
+            return;
+        }
+    }
+}
+
+/// Immediate post-dominators over a forward (acyclic) graph; `succ.len()` is the virtual exit
+/// after the blocks without successors (`usize::MAX`: no path to an exit).
+fn post_dominator_tree(fwd: &[Vec<usize>]) -> Vec<usize> {
+    let n = fwd.len();
+    // reversed graph, node 0 = the virtual exit, node b + 1 = block b
+    let mut r: Vec<Vec<usize>> = vec![Vec::new(); n + 1];
+    for (b, ss) in fwd.iter().enumerate() {
+        if ss.is_empty() {
+            r[0].push(b + 1);
+        }
+        for &s in ss {
+            r[s + 1].push(b + 1);
+        }
+    }
+    let id = dominator_tree(&r);
+    (0..n)
+        .map(|b| match id[b + 1] {
+            usize::MAX => usize::MAX,
+            0 => n,
+            x => x - 1,
+        })
+        .collect()
 }
 
 /// Immediate dominators over the graph without back edges (`usize::MAX`: unreachable).
