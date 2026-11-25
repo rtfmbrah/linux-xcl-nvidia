@@ -286,3 +286,54 @@ fn heap_buffers() {
     let decorations = words.windows(4).filter(|w| w[0] == (4 << 16 | 71) && w[2] == 34 && w[3] == 100).count();
     assert_eq!(decorations, 2);
 }
+
+/// A loop in one arm whose exit joins the other arm (GTA VI shape):
+///   if (tid < 32) v = tid * 3 else { for (i = 0;; i++) { if (i == tid) { v = i * 2; break } if (i + 1 >= 40) { r = 7; goto end } } }
+///   r = v ^ 5; end: out[tid] = r
+#[test]
+fn loop_exit_into_other_arm() {
+    let mut s = Shader::new(Stage::Compute, (6, 6));
+    let output = s.raw_uav(1, 0);
+    let tid = s.thread_id(0);
+    let four = s.m.i32c(4);
+    let off = s.m.bin(BinOp::Mul, tid, four);
+    let entry = s.m.current_block();
+    let (head, latch, other, join, end) = (s.m.new_block(), s.m.new_block(), s.m.new_block(), s.m.new_block(), s.m.new_block());
+    let lim = s.m.i32c(32);
+    let c = s.m.cmp(Pred::ULt, tid, lim);
+    let three = s.m.i32c(3);
+    let t3 = s.m.bin(BinOp::Mul, tid, three);
+    s.m.cond_br(c, join, head);
+    s.m.set_block(head);
+    let i32 = s.m.i32();
+    let i = s.m.phi(i32);
+    let two = s.m.i32c(2);
+    let dbl = s.m.bin(BinOp::Mul, i, two);
+    let hit = s.m.cmp(Pred::Eq, i, tid);
+    s.m.cond_br(hit, join, latch);
+    s.m.set_block(latch);
+    let one = s.m.i32c(1);
+    let i2 = s.m.bin(BinOp::Add, i, one);
+    let forty = s.m.i32c(40);
+    let more = s.m.cmp(Pred::ULt, i2, forty);
+    s.m.cond_br(more, head, other);
+    let zero = s.m.i32c(0);
+    s.m.add_incoming(i, zero, entry);
+    s.m.add_incoming(i, i2, latch);
+    s.m.set_block(other);
+    s.m.br(end);
+    s.m.set_block(join);
+    let v = s.m.phi(i32);
+    s.m.add_incoming(v, t3, entry);
+    s.m.add_incoming(v, dbl, head);
+    let five = s.m.i32c(5);
+    let x = s.m.bin(BinOp::Xor, v, five);
+    s.m.br(end);
+    s.m.set_block(end);
+    let r = s.m.phi(i32);
+    let seven = s.m.i32c(7);
+    s.m.add_incoming(r, x, join);
+    s.m.add_incoming(r, seven, other);
+    s.raw_store(output, off, &[r]);
+    finish(s, "loop_exit_other_arm");
+}

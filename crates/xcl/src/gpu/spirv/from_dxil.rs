@@ -1724,8 +1724,30 @@ fn ladder_partial_joins(succ: &mut Vec<Vec<usize>>, phis: &mut Vec<Vec<(u32, Vec
             }
             let from_t = preds[t].clone();
             let from_m: Vec<usize> = preds[mm].iter().copied().filter(|&p| !cut[p] && dominates(a, p)).collect();
-            if from_m.is_empty() || from_t.iter().any(|p| from_m.contains(p)) {
+            if from_m.is_empty() {
                 continue;
+            }
+            // a block that branches to both (a merged loop exit whose empty block LLVM removed):
+            // its edge to M gets a block of its own first, so the selector has one value per edge
+            if let Some(&p) = from_t.iter().find(|p| from_m.contains(p)) {
+                let e = succ.len();
+                succ.push(vec![mm]);
+                phis.push(Vec::new());
+                for s in succ[p].iter_mut() {
+                    if *s == mm {
+                        *s = e;
+                    }
+                }
+                let mut moved = Vec::new();
+                for (orig, list) in phis[mm].iter_mut() {
+                    let (take, keep): (Vec<_>, Vec<_>) = list.drain(..).partition(|x| x.1 == p);
+                    *list = keep;
+                    list.push((PhiIn::Synth(e, *orig), e));
+                    moved.push((*orig, take));
+                }
+                phis[e] = moved;
+                done = true;
+                break;
             }
             if phis[t].iter().any(|(o, _)| phis[mm].iter().any(|(o2, _)| o == o2)) {
                 continue;
