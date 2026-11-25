@@ -10,9 +10,22 @@ pub mod from_dxil;
 
 static WANTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
-/// Whether the direct translator also makes SPIR-V of compute entries (`xcl shaders --spirv`).
+/// Whether the direct translator also makes SPIR-V of compute entries (`xcl shaders --spirv`,
+/// or `XCL_SPIRV=1` at run time).
 pub fn wanted() -> bool {
-    WANTED.load(std::sync::atomic::Ordering::Relaxed)
+    WANTED.load(std::sync::atomic::Ordering::Relaxed) || live()
+}
+
+/// `XCL_SPIRV=1`: compute programs carry their SPIR-V in an `XSPV` part of the DXIL container,
+/// which the fork's vkd3d-proton build takes instead of running dxil-spirv (Vulkan stage C).
+pub fn live() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("XCL_SPIRV").is_ok_and(|v| v.trim() == "1"))
+}
+
+/// The `XSPV` part: version 1, the workgroup size, the wave size, then the SPIR-V words.
+pub fn xspv_part(numthreads: [u32; 3], wave: u32, words: &[u32]) -> Vec<u8> {
+    [1, numthreads[0], numthreads[1], numthreads[2], wave].iter().chain(words).flat_map(|w| w.to_le_bytes()).collect()
 }
 pub fn set_wanted(on: bool) {
     WANTED.store(on, std::sync::atomic::Ordering::Relaxed);

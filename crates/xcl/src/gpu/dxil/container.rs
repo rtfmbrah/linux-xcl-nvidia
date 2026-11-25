@@ -228,6 +228,42 @@ pub fn container(stage: Stage, sm: (u32, u32), bitcode: &[u8], features: u64, ps
     out
 }
 
+/// `container` with one more part (`tag`, `data`) after the others, signed again.
+pub fn with_part(container: &[u8], tag: [u8; 4], data: &[u8]) -> Option<Vec<u8>> {
+    let u32_at = |o: usize| container.get(o..o + 4).map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]));
+    if container.get(0..4)? != b"DXBC" {
+        return None;
+    }
+    let count = u32_at(28)? as usize;
+    let mut parts: Vec<([u8; 4], &[u8])> = Vec::with_capacity(count + 1);
+    for i in 0..count {
+        let off = u32_at(32 + 4 * i)? as usize;
+        let len = u32_at(off + 4)? as usize;
+        parts.push((container.get(off..off + 4)?.try_into().ok()?, container.get(off + 8..off + 8 + len)?));
+    }
+    parts.push((tag, data));
+    let header = 32 + 4 * parts.len();
+    let total: usize = header + parts.iter().map(|(_, d)| 8 + d.len()).sum::<usize>();
+    let mut out = Vec::with_capacity(total);
+    out.extend_from_slice(&container[..20]);
+    out.extend_from_slice(&container[20..24]);
+    out.extend_from_slice(&(total as u32).to_le_bytes());
+    out.extend_from_slice(&(parts.len() as u32).to_le_bytes());
+    let mut off = header;
+    for (_, d) in &parts {
+        out.extend_from_slice(&(off as u32).to_le_bytes());
+        off += 8 + d.len();
+    }
+    for (cc, d) in &parts {
+        out.extend_from_slice(cc);
+        out.extend_from_slice(&(d.len() as u32).to_le_bytes());
+        out.extend_from_slice(d);
+    }
+    let digest = hash(&out[20..]);
+    out[4..20].copy_from_slice(&digest);
+    Some(out)
+}
+
 // ------------------------------------------------- graphics signatures
 
 /// One row of an `ISG1`/`OSG1`/`PSG1` signature (`DxilProgramSignatureElement`).

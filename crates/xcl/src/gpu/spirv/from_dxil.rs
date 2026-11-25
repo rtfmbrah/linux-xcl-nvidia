@@ -79,6 +79,10 @@ struct Tx<'a> {
     ptr_sc: HashMap<Value, u32>,
     /// buffer variable → accesses seen (1 read, 2 write)
     buffer_access: HashMap<u32, u8>,
+    /// node being emitted (for `subst`)
+    cur: usize,
+    subst: Vec<(Vec<bool>, usize, u32)>,
+    synth_ids: HashMap<(usize, u32), u32>,
 }
 
 fn err<T>(msg: impl Into<String>) -> Result<T, String> {
@@ -163,6 +167,12 @@ impl<'a> Tx<'a> {
 
     /// The SPIR-V id of an operand (constants are created on first use).
     fn id(&mut self, v: Value) -> Result<u32, String> {
+        if let Value::Inst(i) = v {
+            let cur = self.cur;
+            if let Some(&(_, mrg, e)) = self.subst.iter().find(|(body, _, e)| *e == i && !body.get(cur).copied().unwrap_or(true)) {
+                return Ok(self.synth_ids[&(mrg, e)]);
+            }
+        }
         if let Some(Val::Id(id)) = self.vals.get(&v) {
             return Ok(*id);
         }
@@ -402,6 +412,10 @@ impl<'a> Tx<'a> {
                 // atomicBinOp(handle, op, c0, c1, c2, v) / atomicCompareExchange(handle, c0, c1, c2, cmp, new)
                 // on a raw buffer: c0 is the byte offset
                 let Some(&Val::Buffer(buf)) = self.vals.get(&a[0]) else { return err(format!("{name} on an unsupported handle")) };
+                if !matches!(self.m.type_def(self.m.inst_ty(inst)), TypeDef::Int(32)) {
+                    // the buffer is declared as uint[]: 64-bit atomics need a view of their own
+                    return err(format!("{name} on a non-32-bit value"));
+                }
                 let t = self.ty(self.m.inst_ty(inst))?;
                 let off_at = if opcode == 78 { 2 } else { 1 };
                 let off = self.id(a[off_at])?;
@@ -1113,6 +1127,9 @@ struct Structure {
     split: HashMap<usize, usize>,
     /// synthetic node that switches on an exit selector phi (key) to its successors
     switches: HashMap<usize, u32>,
+    /// loop values used after a merged multi-exit loop: (loop body, merge node, instruction);
+    /// outside the body the instruction reads as the merge node's phi for it
+    subst: Vec<(Vec<bool>, usize, u32)>,
 }
 
 /// Finds loops (back edges of a DFS; one latch and one exit each) and selection merges (the
@@ -1181,6 +1198,7 @@ fn structure(m: &Module) -> Result<Structure, String> {
     // a loop that leaves to several blocks: every exit edge goes to one new merge node instead,
     // which switches on a selector phi to where the edge went (and carries the exits' phis)
     let mut switches: HashMap<usize, u32> = HashMap::new();
+    let mut subst: Vec<(Vec<bool>, usize, u32)> = Vec::new();
     loop {
         let (back, _) = dfs(&succ);
         let mut preds: Vec<Vec<usize>> = vec![Vec::new(); succ.len()];
@@ -1224,6 +1242,43 @@ fn structure(m: &Module) -> Result<Structure, String> {
             if from.iter().any(|&p| edges.iter().filter(|e| e.0 == p).map(|e| e.1).collect::<std::collections::BTreeSet<_>>().len() > 1) {
                 return err("loop exit block that leaves to two places");
             }
+            // values of the loop used after it other than through the exits' phis: after the
+            // merge they reach their uses through a phi of the merge node (undefined on edges
+            // from blocks they do not dominate), and every use outside the loop reads that phi
+            let defined: std::collections::HashSet<u32> =
+                (0..n0).filter(|&b| body[b]).flat_map(|b| m.block_insts(Block(b as u32)).iter().copied()).collect();
+            let mut escaping: Vec<u32> = Vec::new();
+            for b in (0..n0).filter(|&b| !body[b]) {
+                for &i in m.block_insts(Block(b as u32)) {
+                    let uses: Vec<Value> = match m.inst_info(i) {
+                        crate::gpu::dxil::module::InstInfo::Call(_, args) => args.to_vec(),
+                        crate::gpu::dxil::module::InstInfo::Phi(list) => {
+                            list.iter().filter(|(_, from_b)| !body[from_b.0 as usize]).map(|(v, _)| *v).collect()
+                        }
+                        crate::gpu::dxil::module::InstInfo::Load(p) => vec![p],
+                        crate::gpu::dxil::module::InstInfo::Store(p, v) => vec![p, v],
+                        crate::gpu::dxil::module::InstInfo::Other(v) => v,
+                        crate::gpu::dxil::module::InstInfo::Term(c, _) => c.into_iter().collect(),
+                    };
+                    for u in uses {
+                        if let Value::Inst(d) = u {
+                            if defined.contains(&d) && !escaping.contains(&d) && !matches!(m.inst_op(d), Op::Alloca(..)) {
+                                escaping.push(d);
+                            }
+                        }
+                    }
+                }
+            }
+            let idom = dominator_tree(&succ);
+            let dominates_node = |a: usize, mut x: usize| loop {
+                if x == a {
+                    return true;
+                }
+                if x == 0 || idom[x] == usize::MAX || idom[x] == x {
+                    return false;
+                }
+                x = idom[x];
+            };
             let mrg = succ.len();
             let key = SELECTOR + switches.len() as u32;
             succ.push(targets.clone());
@@ -1249,6 +1304,12 @@ fn structure(m: &Module) -> Result<Structure, String> {
                         *t = mrg;
                     }
                 }
+            }
+            for &e in &escaping {
+                let def = m.def_block(Value::Inst(e)).map_or(usize::MAX, |b| b.0 as usize);
+                let entries = from.iter().map(|&p| (if def != usize::MAX && dominates_node(def, p) { PhiIn::Val(Value::Inst(e)) } else { PhiIn::Undef }, p)).collect();
+                phis[mrg].push((e, entries));
+                subst.push((body.clone(), mrg, e));
             }
             switches.insert(mrg, key);
             changed = true;
@@ -1474,7 +1535,52 @@ fn structure(m: &Module) -> Result<Structure, String> {
         loops_out.insert(h, (merge_of[&h], cont));
     }
     let selections = sel_headers.iter().map(|&h| (h, merge_of[&h])).collect();
-    Ok(Structure { order, succ: vsucc, phis, loops: loops_out, selections, split, switches })
+    Ok(Structure { order, succ: vsucc, phis, loops: loops_out, selections, split, switches, subst })
+}
+
+/// Immediate dominators over the graph without back edges (`usize::MAX`: unreachable).
+fn dominator_tree(succ: &[Vec<usize>]) -> Vec<usize> {
+    let n = succ.len();
+    let (back, post) = dfs(succ);
+    let topo: Vec<usize> = post.iter().rev().copied().collect();
+    let mut rank = vec![usize::MAX; n];
+    for (i, &b) in topo.iter().enumerate() {
+        rank[b] = i;
+    }
+    let mut preds: Vec<Vec<usize>> = vec![Vec::new(); n];
+    for (b, ss) in succ.iter().enumerate() {
+        for &t in ss {
+            if !back.contains(&(b, t)) {
+                preds[t].push(b);
+            }
+        }
+    }
+    let mut idom = vec![usize::MAX; n];
+    idom[0] = 0;
+    for &b in topo.iter().skip(1) {
+        let mut new = usize::MAX;
+        for &p in &preds[b] {
+            if idom[p] == usize::MAX {
+                continue;
+            }
+            new = if new == usize::MAX {
+                p
+            } else {
+                let (mut x, mut y) = (new, p);
+                while x != y {
+                    while rank[x] > rank[y] {
+                        x = idom[x];
+                    }
+                    while rank[y] > rank[x] {
+                        y = idom[y];
+                    }
+                }
+                x
+            };
+        }
+        idom[b] = new;
+    }
+    idom
 }
 
 /// Back edges of a DFS from node 0, and its post-order.
@@ -1550,6 +1656,9 @@ pub fn translate_compute(m: &Module, numthreads: [u32; 3]) -> Result<Vec<u32>, S
         pending_phis: Vec::new(),
         ptr_sc: HashMap::new(),
         buffer_access: HashMap::new(),
+        cur: 0,
+        subst: Vec::new(),
+        synth_ids: HashMap::new(),
     };
     tx.w.capability(CAP_SHADER);
     tx.labels = (0..st.succ.len()).map(|_| tx.w.id()).collect();
@@ -1565,6 +1674,8 @@ pub fn translate_compute(m: &Module, numthreads: [u32; 3]) -> Result<Vec<u32>, S
             }
         }
     }
+    tx.synth_ids = synth_ids.clone();
+    tx.subst = st.subst.clone();
     // group-shared globals referenced by the code
     for b in 0..n {
         for &i in m.block_insts(Block(b as u32)) {
@@ -1604,6 +1715,7 @@ pub fn translate_compute(m: &Module, numthreads: [u32; 3]) -> Result<Vec<u32>, S
     }
 
     for &b in &st.order {
+        tx.cur = b;
         let label = tx.labels[b];
         tx.emit(op::LABEL, &[label]);
         if b >= n {
@@ -1678,6 +1790,8 @@ pub fn translate_compute(m: &Module, numthreads: [u32; 3]) -> Result<Vec<u32>, S
     for (at, node, orig) in std::mem::take(&mut tx.pending_phis) {
         let list = st.phis[node].iter().find(|p| p.0 == orig).map(|p| p.1.clone()).unwrap_or_default();
         for (k, (val, from)) in list.into_iter().enumerate() {
+            // the value as it is at the end of the predecessor
+            tx.cur = from;
             let id = match val {
                 PhiIn::Val(v) => tx.id(v)?,
                 PhiIn::Synth(x, o) => synth_ids[&(x, o)],

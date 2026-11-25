@@ -651,6 +651,11 @@ impl Lw {
                 return Err(format!("direct DXIL failed validation: {e}\n--- disassembly ---\n{dis}"));
             }
         }
+        // `XCL_SPIRV=1`: the SPIR-V rides along for the fork's vkd3d-proton build
+        let c = match (&spirv, crate::gpu::spirv::live()) {
+            (Some(Ok(words)), true) => super::container::with_part(&c, *b"XSPV", &crate::gpu::spirv::xspv_part(numthreads, hw, words)).unwrap_or(c),
+            _ => c,
+        };
         Ok(Kernel { dxil: c, spirv, static_samplers: self.static_used.iter().map(|&(w, c, _)| (w, c)).collect(), dispatch_chain })
     }
 }
