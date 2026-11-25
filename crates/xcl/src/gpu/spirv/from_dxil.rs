@@ -433,12 +433,18 @@ impl<'a> Tx<'a> {
     }
 
     fn atomic(&mut self, t: u32, opn: u16, p: u32, x: u32, scope: u32, sem: u32) -> u32 {
+        if scope == 1 {
+            self.w.capability(5346); // VulkanMemoryModelDeviceScope
+        }
         let (sc, se) = (self.w.constant_u32(scope), self.w.constant_u32(sem));
         let r = self.w.id();
         self.emit(opn, &[t, r, p, sc, se, x]);
         r
     }
     fn cmpxchg(&mut self, t: u32, p: u32, new: u32, cmp: u32, scope: u32, sem: u32) -> u32 {
+        if scope == 1 {
+            self.w.capability(5346); // VulkanMemoryModelDeviceScope
+        }
         let (sc, se, su) = (self.w.constant_u32(scope), self.w.constant_u32(sem), self.w.constant_u32(sem & !SEM_ACQUIRE_RELEASE | 0x2));
         let r = self.w.id();
         // the unequal case only reads: Acquire instead of AcquireRelease
@@ -1081,7 +1087,14 @@ enum PhiIn {
     Val(Value),
     /// the phi a synthetic block (node) holds for the original phi `inst`
     Synth(usize, u32),
+    /// a constant (the exit selector of a loop's merged exits)
+    Lit(u32),
+    /// no value on this edge
+    Undef,
 }
+
+/// Phi keys from here on are exit selectors (`uint`), not module instructions.
+const SELECTOR: u32 = 0xF000_0000;
 
 /// How the CFG maps to SPIR-V's structured control flow. Nodes `0..n` are the module's
 /// blocks, nodes from `n` are synthetic merge blocks the structuring inserts.
@@ -1096,6 +1109,10 @@ struct Structure {
     loops: HashMap<usize, (usize, usize)>,
     /// selection header → merge node
     selections: HashMap<usize, usize>,
+    /// loop header that also selects → the synthetic node that holds its branch
+    split: HashMap<usize, usize>,
+    /// synthetic node that switches on an exit selector phi (key) to its successors
+    switches: HashMap<usize, u32>,
 }
 
 /// Finds loops (back edges of a DFS; one latch and one exit each) and selection merges (the
@@ -1104,32 +1121,145 @@ struct Structure {
 /// would share a merge block get synthetic merge blocks of their own (the outermost keeps
 /// the original), with the phis of the original split over them.
 fn structure(m: &Module) -> Result<Structure, String> {
-    let n = m.block_count();
-    let succ: Vec<Vec<usize>> = (0..n).map(|b| successors(m, Block(b as u32)).iter().map(|x| x.0 as usize).collect()).collect();
-    // DFS: back edges, and a post-order of the forward (back-edge-free) graph
-    let mut back: Vec<(usize, usize)> = Vec::new();
-    let mut state = vec![0u8; n];
-    let mut post: Vec<usize> = Vec::new();
-    let mut stack: Vec<(usize, usize)> = vec![(0, 0)];
-    state[0] = 1;
-    while let Some(&mut (b, ref mut k)) = stack.last_mut() {
-        if *k < succ[b].len() {
-            let s = succ[b][*k];
-            *k += 1;
-            match state[s] {
-                0 => {
-                    state[s] = 1;
-                    stack.push((s, 0));
-                }
-                1 => back.push((b, s)),
-                _ => {}
+    let n0 = m.block_count();
+    let mut succ: Vec<Vec<usize>> = (0..n0).map(|b| successors(m, Block(b as u32)).iter().map(|x| x.0 as usize).collect()).collect();
+    let mut phis: Vec<Vec<(u32, Vec<(PhiIn, usize)>)>> = (0..n0)
+        .map(|b| {
+            m.block_insts(Block(b as u32))
+                .iter()
+                .filter_map(|&i| match m.inst_op(i) {
+                    Op::Phi(list) => Some((i, list.iter().map(|&(v, p)| (PhiIn::Val(v), p.0 as usize)).collect())),
+                    _ => None,
+                })
+                .collect()
+        })
+        .collect();
+    // a loop header whose branch also selects between blocks of the loop (the compact form's
+    // `switch` dispatcher): its branch moves to a node of its own, so the header can carry the
+    // loop merge and that node the selection merge
+    let mut split = HashMap::new();
+    {
+        let (back, _) = dfs(&succ);
+        let mut headers: Vec<usize> = back.iter().map(|e| e.1).collect();
+        headers.sort_unstable();
+        headers.dedup();
+        let mut preds: Vec<Vec<usize>> = vec![Vec::new(); succ.len()];
+        for (b, ss) in succ.iter().enumerate() {
+            for &t in ss {
+                preds[t].push(b);
             }
-        } else {
-            state[b] = 2;
-            post.push(b);
-            stack.pop();
+        }
+        for h in headers {
+            let mut body = vec![false; succ.len()];
+            body[h] = true;
+            let mut work: Vec<usize> = back.iter().filter(|e| e.1 == h).map(|e| e.0).collect();
+            while let Some(x) = work.pop() {
+                if !body[x] {
+                    body[x] = true;
+                    work.extend(preds[x].iter().copied());
+                }
+            }
+            let inner = succ[h].iter().filter(|&&t| t != h && body[t]).count();
+            if inner > 1 {
+                let hs = succ.len();
+                let moved = std::mem::replace(&mut succ[h], vec![hs]);
+                succ.push(moved);
+                phis.push(Vec::new());
+                for &t in &succ[hs] {
+                    for (_, list) in phis[t].iter_mut() {
+                        for e in list.iter_mut() {
+                            if e.1 == h {
+                                e.1 = hs;
+                            }
+                        }
+                    }
+                }
+                split.insert(h, hs);
+            }
         }
     }
+    // a loop that leaves to several blocks: every exit edge goes to one new merge node instead,
+    // which switches on a selector phi to where the edge went (and carries the exits' phis)
+    let mut switches: HashMap<usize, u32> = HashMap::new();
+    loop {
+        let (back, _) = dfs(&succ);
+        let mut preds: Vec<Vec<usize>> = vec![Vec::new(); succ.len()];
+        for (b, ss) in succ.iter().enumerate() {
+            for &t in ss {
+                preds[t].push(b);
+            }
+        }
+        let mut headers: Vec<usize> = back.iter().map(|e| e.1).collect();
+        headers.sort_unstable();
+        headers.dedup();
+        // innermost loops first: the fewest blocks
+        let mut bodies: Vec<(usize, Vec<bool>)> = headers
+            .iter()
+            .map(|&h| {
+                let mut body = vec![false; succ.len()];
+                body[h] = true;
+                let mut work: Vec<usize> = back.iter().filter(|e| e.1 == h).map(|e| e.0).collect();
+                while let Some(x) = work.pop() {
+                    if !body[x] {
+                        body[x] = true;
+                        work.extend(preds[x].iter().copied());
+                    }
+                }
+                (h, body)
+            })
+            .collect();
+        bodies.sort_by_key(|(_, b)| b.iter().filter(|&&x| x).count());
+        let mut changed = false;
+        for (_, body) in bodies {
+            let edges: Vec<(usize, usize)> = (0..succ.len()).filter(|&x| body[x]).flat_map(|x| succ[x].iter().map(move |&t| (x, t))).filter(|&(_, t)| !body[t]).collect();
+            let mut targets: Vec<usize> = edges.iter().map(|e| e.1).collect();
+            targets.sort_unstable();
+            targets.dedup();
+            if targets.len() < 2 {
+                continue;
+            }
+            let mut from: Vec<usize> = edges.iter().map(|e| e.0).collect();
+            from.sort_unstable();
+            from.dedup();
+            if from.iter().any(|&p| edges.iter().filter(|e| e.0 == p).map(|e| e.1).collect::<std::collections::BTreeSet<_>>().len() > 1) {
+                return err("loop exit block that leaves to two places");
+            }
+            let mrg = succ.len();
+            let key = SELECTOR + switches.len() as u32;
+            succ.push(targets.clone());
+            phis.push(Vec::new());
+            let target_of = |p: usize| edges.iter().find(|e| e.0 == p).map(|e| e.1).unwrap();
+            phis[mrg].push((key, from.iter().map(|&p| (PhiIn::Lit(targets.iter().position(|&t| t == target_of(p)).unwrap() as u32), p)).collect()));
+            for &t in &targets {
+                let mut moved = Vec::new();
+                for (orig, list) in phis[t].iter_mut() {
+                    let (take, keep): (Vec<_>, Vec<_>) = list.drain(..).partition(|e| from.contains(&e.1));
+                    *list = keep;
+                    list.push((PhiIn::Synth(mrg, *orig), mrg));
+                    moved.push((*orig, take));
+                }
+                for (orig, take) in moved {
+                    let entries = from.iter().map(|&p| (take.iter().find(|e| e.1 == p).map_or(PhiIn::Undef, |e| e.0), p)).collect();
+                    phis[mrg].push((orig, entries));
+                }
+            }
+            for &p in &from {
+                for t in succ[p].iter_mut() {
+                    if targets.contains(t) && !body[*t] {
+                        *t = mrg;
+                    }
+                }
+            }
+            switches.insert(mrg, key);
+            changed = true;
+            break; // the graph changed: look again
+        }
+        if !changed {
+            break;
+        }
+    }
+    let n = succ.len();
+    let (back, post) = dfs(&succ);
     let is_back = |b: usize, s: usize| back.contains(&(b, s));
     let mut preds: Vec<Vec<usize>> = vec![Vec::new(); n];
     for b in 0..n {
@@ -1263,17 +1393,6 @@ fn structure(m: &Module) -> Result<Structure, String> {
     let mut vsucc: Vec<Vec<usize>> = succ.clone();
     let mut owner: Vec<usize> = (0..n).collect(); // synthetic node → construct header it closes
     let mut order: Vec<usize> = topo.clone();
-    let mut phis: Vec<Vec<(u32, Vec<(PhiIn, usize)>)>> = (0..n)
-        .map(|b| {
-            m.block_insts(Block(b as u32))
-                .iter()
-                .filter_map(|&i| match m.inst_op(i) {
-                    Op::Phi(list) => Some((i, list.iter().map(|&(v, p)| (PhiIn::Val(v), p.0 as usize)).collect())),
-                    _ => None,
-                })
-                .collect()
-        })
-        .collect();
     let new_node = |vsucc: &mut Vec<Vec<usize>>, owner: &mut Vec<usize>, phis: &mut Vec<Vec<(u32, Vec<(PhiIn, usize)>)>>, own: usize| {
         vsucc.push(Vec::new());
         owner.push(own);
@@ -1301,12 +1420,12 @@ fn structure(m: &Module) -> Result<Structure, String> {
         // the outermost (dominating every other) keeps the block
         hs.sort_by_key(|&h| rank[h]);
         let keeper = hs[0];
-        if !hs.iter().all(|&h| dominates(keeper, h)) {
-            return err(format!("constructs {hs:?} share merge block {mrg} without one enclosing the others"));
-        }
+        // siblings (none enclosing the others): every one gets a merge block of its own
+        let siblings = !hs.iter().all(|&h| dominates(keeper, h));
         // the others, innermost first, get a block that branches on to `mrg`; so does the
         // keeper when `mrg` is also reached from outside it (a merge must be dominated)
-        let keeper_too = !dominates(keeper, mrg);
+        let is_continue = loops.values().any(|&(_, l)| l == mrg);
+        let keeper_too = siblings || !dominates(keeper, mrg) || (is_continue && !loops.contains_key(&keeper));
         if !keeper_too {
             merge_of.insert(keeper, mrg);
         }
@@ -1355,7 +1474,62 @@ fn structure(m: &Module) -> Result<Structure, String> {
         loops_out.insert(h, (merge_of[&h], cont));
     }
     let selections = sel_headers.iter().map(|&h| (h, merge_of[&h])).collect();
-    Ok(Structure { order, succ: vsucc, phis, loops: loops_out, selections })
+    Ok(Structure { order, succ: vsucc, phis, loops: loops_out, selections, split, switches })
+}
+
+/// Back edges of a DFS from node 0, and its post-order.
+fn dfs(succ: &[Vec<usize>]) -> (Vec<(usize, usize)>, Vec<usize>) {
+    let n = succ.len();
+    let mut back: Vec<(usize, usize)> = Vec::new();
+    let mut state = vec![0u8; n];
+    let mut post: Vec<usize> = Vec::new();
+    let mut stack: Vec<(usize, usize)> = vec![(0, 0)];
+    state[0] = 1;
+    while let Some(&mut (b, ref mut k)) = stack.last_mut() {
+        if *k < succ[b].len() {
+            let s = succ[b][*k];
+            *k += 1;
+            match state[s] {
+                0 => {
+                    state[s] = 1;
+                    stack.push((s, 0));
+                }
+                1 => back.push((b, s)),
+                _ => {}
+            }
+        } else {
+            state[b] = 2;
+            post.push(b);
+            stack.pop();
+        }
+    }
+    (back, post)
+}
+
+/// The terminator `term` (of a module block) as the end of node `b`, to `b`'s successors.
+fn emit_terminator(tx: &mut Tx, st: &Structure, b: usize, term: u32) -> Result<(), String> {
+    let m = tx.m;
+    let tl: Vec<u32> = st.succ[b].iter().map(|&x| tx.labels[x]).collect();
+    match m.inst_op(term).clone() {
+        Op::Br(_) => tx.emit(op::BRANCH, &[tl[0]]),
+        Op::CondBr(c, _, _) => {
+            let c = tx.id(c)?;
+            tx.emit(op::BRANCH_CONDITIONAL, &[c, tl[0], tl[1]]);
+        }
+        Op::Switch(v, _, cases) => {
+            let x = tx.id(v)?;
+            let mut ops = vec![x, tl[0]];
+            for (k, (cv, _)) in cases.iter().enumerate() {
+                ops.push(m.const_u64(*cv).ok_or("switch case not constant")? as u32);
+                ops.push(tl[k + 1]);
+            }
+            tx.emit(op::SWITCH, &ops);
+        }
+        Op::Ret => tx.emit(op::RETURN, &[]),
+        Op::Unreachable => tx.emit(op::UNREACHABLE, &[]),
+        other => return err(format!("block {b} ends in {other:?}")),
+    }
+    Ok(())
 }
 
 pub fn translate_compute(m: &Module, numthreads: [u32; 3]) -> Result<Vec<u32>, String> {
@@ -1435,13 +1609,37 @@ pub fn translate_compute(m: &Module, numthreads: [u32; 3]) -> Result<Vec<u32>, S
         if b >= n {
             // a synthetic merge block: its phis, then on to the next merge
             for (orig, _) in &st.phis[b] {
-                let t = tx.ty(m.inst_ty(*orig))?;
+                let t = if *orig >= SELECTOR { tx.uint() } else { tx.ty(m.inst_ty(*orig))? };
                 let r = synth_ids[&(b, *orig)];
                 let mut ops = vec![t, r];
                 ops.resize(2 + 2 * st.phis[b].iter().find(|p| p.0 == *orig).map_or(0, |p| p.1.len()), 0);
                 let at = tx.body.len() + 1;
                 tx.emit(op::PHI, &ops);
                 tx.pending_phis.push((at, b, *orig));
+            }
+            if let Some(&key) = st.switches.get(&b) {
+                // merged loop exits: on to where the loop was left
+                if let Some(&mrg) = st.selections.get(&b) {
+                    tx.emit(op::SELECTION_MERGE, &[tx.labels[mrg], 0]);
+                }
+                let sel = synth_ids[&(b, key)];
+                let tl: Vec<u32> = st.succ[b].iter().map(|&x| tx.labels[x]).collect();
+                let mut ops = vec![sel, *tl.last().unwrap()];
+                for (k, &l) in tl.iter().enumerate().take(tl.len() - 1) {
+                    ops.push(k as u32);
+                    ops.push(l);
+                }
+                tx.emit(op::SWITCH, &ops);
+                continue;
+            }
+            if let Some((&h, _)) = st.split.iter().find(|(_, &x)| x == b) {
+                // the branch of split loop header `h`
+                if let Some(&mrg) = st.selections.get(&b) {
+                    tx.emit(op::SELECTION_MERGE, &[tx.labels[mrg], 0]);
+                }
+                let term = *m.block_insts(Block(h as u32)).last().ok_or("empty loop header")?;
+                emit_terminator(&mut tx, &st, b, term)?;
+                continue;
             }
             match st.succ[b].first() {
                 Some(&t) => tx.emit(op::BRANCH, &[tx.labels[t]]),
@@ -1470,31 +1668,11 @@ pub fn translate_compute(m: &Module, numthreads: [u32; 3]) -> Result<Vec<u32>, S
         } else if let Some(&mrg) = st.selections.get(&b) {
             tx.emit(op::SELECTION_MERGE, &[tx.labels[mrg], 0]);
         }
-        let tl: Vec<u32> = st.succ[b].iter().map(|&x| tx.labels[x]).collect();
-        let to = |k: usize| tl[k];
-        match m.inst_op(*term).clone() {
-            Op::Br(_) => {
-                let t = to(0);
-                tx.emit(op::BRANCH, &[t]);
-            }
-            Op::CondBr(c, _, _) => {
-                let c = tx.id(c)?;
-                let (t, f) = (to(0), to(1));
-                tx.emit(op::BRANCH_CONDITIONAL, &[c, t, f]);
-            }
-            Op::Switch(v, _, cases) => {
-                let x = tx.id(v)?;
-                let mut ops = vec![x, to(0)];
-                for (k, (cv, _)) in cases.iter().enumerate() {
-                    ops.push(m.const_u64(*cv).ok_or("switch case not constant")? as u32);
-                    ops.push(to(k + 1));
-                }
-                tx.emit(op::SWITCH, &ops);
-            }
-            Op::Ret => tx.emit(op::RETURN, &[]),
-            Op::Unreachable => tx.emit(op::UNREACHABLE, &[]),
-            other => return err(format!("block {b} ends in {other:?}")),
+        if let Some(&hs) = st.split.get(&b) {
+            tx.emit(op::BRANCH, &[tx.labels[hs]]);
+            continue;
         }
+        emit_terminator(&mut tx, &st, b, *term)?;
     }
 
     for (at, node, orig) in std::mem::take(&mut tx.pending_phis) {
@@ -1503,6 +1681,11 @@ pub fn translate_compute(m: &Module, numthreads: [u32; 3]) -> Result<Vec<u32>, S
             let id = match val {
                 PhiIn::Val(v) => tx.id(v)?,
                 PhiIn::Synth(x, o) => synth_ids[&(x, o)],
+                PhiIn::Lit(k) => tx.w.constant_u32(k),
+                PhiIn::Undef => {
+                    let t = if orig >= SELECTOR { tx.uint() } else { tx.ty(m.inst_ty(orig))? };
+                    tx.w.undef(t)
+                }
             };
             tx.body[at + 2 + 2 * k] = id;
             tx.body[at + 3 + 2 * k] = tx.labels[from];

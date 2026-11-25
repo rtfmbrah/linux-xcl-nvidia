@@ -125,23 +125,94 @@ fn counting_loop() {
     finish(s, "counting_loop");
 }
 
-/// A loop with two exits is refused with a message (until it is restructured).
+/// A loop with two exits: i = 0; loop { if (i == tid) { out = i * 2; break A } i++; if (i >= 40) break B }
+/// A: out[tid] = v (v = i*2 from the loop), B: out[tid] = 7
 #[test]
-fn loop_with_two_exits_is_refused() {
+fn loop_with_two_exits() {
     let mut s = Shader::new(Stage::Compute, (6, 6));
+    let output = s.raw_uav(0, 0);
+    let tid = s.thread_id(0);
+    let four = s.m.i32c(4);
+    let off = s.m.bin(BinOp::Mul, tid, four);
+    let entry = s.m.current_block();
     let head = s.m.new_block();
-    let body = s.m.new_block();
-    let (exit1, exit2) = (s.m.new_block(), s.m.new_block());
+    let latch = s.m.new_block();
+    let (exit_a, exit_b) = (s.m.new_block(), s.m.new_block());
     s.m.br(head);
     s.m.set_block(head);
-    let t = s.m.i1c(true);
-    s.m.cond_br(t, body, exit1);
-    s.m.set_block(body);
-    s.m.cond_br(t, head, exit2);
-    s.m.set_block(exit1);
+    let i32 = s.m.i32();
+    let i = s.m.phi(i32);
+    let two = s.m.i32c(2);
+    let dbl = s.m.bin(BinOp::Mul, i, two);
+    let hit = s.m.cmp(Pred::Eq, i, tid);
+    s.m.cond_br(hit, exit_a, latch);
+    s.m.set_block(latch);
+    let one = s.m.i32c(1);
+    let i2 = s.m.bin(BinOp::Add, i, one);
+    let forty = s.m.i32c(40);
+    let more = s.m.cmp(Pred::ULt, i2, forty);
+    s.m.cond_br(more, head, exit_b);
+    let zero = s.m.i32c(0);
+    s.m.add_incoming(i, zero, entry);
+    s.m.add_incoming(i, i2, latch);
+    s.m.set_block(exit_a);
+    let v = s.m.phi(i32);
+    s.m.add_incoming(v, dbl, head);
+    s.raw_store(output, off, &[v]);
     s.m.ret();
-    s.m.set_block(exit2);
+    s.m.set_block(exit_b);
+    let seven = s.m.i32c(7);
+    s.raw_store(output, off, &[seven]);
     s.m.ret();
-    let e = translate_compute(&s.m, [1, 1, 1]).unwrap_err();
-    assert!(e.contains("exits"), "{e}");
+    finish(s, "loop_two_exits");
+}
+
+/// The compact form's shape: a loop whose header dispatches with a `switch`
+///   i = 0; acc = 0; loop { switch (i & 3) { 0: acc += 1; 1: acc += 10; default: acc += 100 } i++ } while (i < tid)
+#[test]
+fn loop_header_with_switch() {
+    let mut s = Shader::new(Stage::Compute, (6, 6));
+    let output = s.raw_uav(0, 0);
+    let tid = s.thread_id(0);
+    let entry = s.m.current_block();
+    let head = s.m.new_block();
+    let (c0, c1, cd) = (s.m.new_block(), s.m.new_block(), s.m.new_block());
+    let latch = s.m.new_block();
+    let exit = s.m.new_block();
+    s.m.br(head);
+    s.m.set_block(head);
+    let i32 = s.m.i32();
+    let i = s.m.phi(i32);
+    let acc = s.m.phi(i32);
+    let three = s.m.i32c(3);
+    let sel = s.m.bin(BinOp::And, i, three);
+    let (k0, k1) = (s.m.i32c(0), s.m.i32c(1));
+    s.m.switch(sel, cd, &[(k0, c0), (k1, c1)]);
+    let mut adds = Vec::new();
+    for (b, v) in [(c0, 1), (c1, 10), (cd, 100)] {
+        s.m.set_block(b);
+        let k = s.m.i32c(v);
+        let r = s.m.bin(BinOp::Add, acc, k);
+        adds.push((r, b));
+        s.m.br(latch);
+    }
+    s.m.set_block(latch);
+    let acc2 = s.m.phi(i32);
+    for (r, b) in adds {
+        s.m.add_incoming(acc2, r, b);
+    }
+    let one = s.m.i32c(1);
+    let i2 = s.m.bin(BinOp::Add, i, one);
+    let more = s.m.cmp(Pred::ULt, i2, tid);
+    s.m.cond_br(more, head, exit);
+    let zero = s.m.i32c(0);
+    s.m.add_incoming(i, zero, entry);
+    s.m.add_incoming(i, i2, latch);
+    s.m.add_incoming(acc, zero, entry);
+    s.m.add_incoming(acc, acc2, latch);
+    s.m.set_block(exit);
+    let four = s.m.i32c(4);
+    let off = s.m.bin(BinOp::Mul, tid, four);
+    s.raw_store(output, off, &[acc2]);
+    finish(s, "loop_switch");
 }
