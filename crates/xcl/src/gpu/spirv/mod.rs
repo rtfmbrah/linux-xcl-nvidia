@@ -55,6 +55,23 @@ pub fn allowed(dxil: &[u8]) -> bool {
     list.as_ref().is_none_or(|l| l.contains(&crate::gpu::shader::fnv64(dxil)))
 }
 
+/// With `XCL_SPIRV=1`, a tag for the translation caches' identity: the allowlist's contents
+/// (FNV-1a 64; "all" without one) decide which programs carry SPIR-V or go the HLSL path.
+pub fn cache_tag() -> Option<String> {
+    static TAG: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+    TAG.get_or_init(|| {
+        if !live() {
+            return None;
+        }
+        let list = std::env::var("XCL_SPIRV_ALLOW").ok().and_then(|p| std::fs::read(p).ok());
+        Some(match list {
+            Some(bytes) => format!("xcl-spirv-allow-{:016x}", crate::gpu::shader::fnv64(&bytes)),
+            None => "xcl-spirv-all".to_string(),
+        })
+    })
+    .clone()
+}
+
 /// Logs what became of a compute program's SPIR-V at run time (`attached`, or why there is
 /// none): each outcome the first time, then every 100th.
 pub fn note_outcome(reason: &str) {

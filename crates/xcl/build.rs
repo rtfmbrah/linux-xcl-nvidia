@@ -82,8 +82,11 @@ fn main() {
     println!("cargo:rustc-env=XCL_PER_LANE_SOURCE_ID={p:016x}");
     // a directory: cargo looks at every file under it
     println!("cargo:rerun-if-changed=src/gpu/dxil");
+    println!("cargo:rerun-if-changed=src/gpu/spirv");
     let mut sources = Vec::new();
     direct_sources(&root.join("src/gpu/dxil"), &mut sources);
+    // the SPIR-V a compute program carries (`XCL_SPIRV=1`) is part of the direct output
+    direct_sources(&root.join("src/gpu/spirv"), &mut sources);
     sources.sort();
     let mut d = 0xcbf2_9ce4_8422_2325u64;
     for path in &sources {

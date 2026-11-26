@@ -295,6 +295,12 @@ mod translated {
                 b if Backend::current() != Backend::Hlsl && b != 1536 * 1024 => identity_for(&id.to_string(), &format!("xcl-direct-compact-kb-{}", b >> 10)),
                 _ => id,
             };
+            // `XCL_SPIRV=1`: which programs carry SPIR-V (and which go the HLSL path instead)
+            // follows the allowlist, so its entries are kept apart per allowlist
+            let id = match crate::gpu::spirv::cache_tag() {
+                Some(tag) => identity_for(&id.to_string(), &tag),
+                None => id,
+            };
             // `XCL_PER_LANE=1` (direct compute only): its entries under their own identity
             if Backend::current() != Backend::Hlsl && crate::gpu::recomp::lower_dxil::enabled() {
                 identity_for(&id.to_string(), concat!("xcl-per-lane-", env!("XCL_PER_LANE_SOURCE_ID")))
@@ -537,6 +543,10 @@ mod translated {
             None => id,
         };
         let id = identity_for(&id.to_string(), &format!("dispatch-split-{split_limit}"));
+        let id = match crate::gpu::spirv::cache_tag() {
+            Some(tag) => identity_for(&id.to_string(), &tag),
+            None => id,
+        };
         if crate::gpu::recomp::lower_dxil::enabled() {
             identity_for(&id.to_string(), concat!("xcl-per-lane-", env!("XCL_PER_LANE_SOURCE_ID")))
         } else {
