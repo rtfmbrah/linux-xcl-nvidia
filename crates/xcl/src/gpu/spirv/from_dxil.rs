@@ -1695,7 +1695,9 @@ fn structure(m: &Module) -> Result<Structure, String> {
         if let Some(h) = loop_of[b] {
             let (mrg, cont) = loops[&h];
             let other = succ[b].iter().filter(|&&s| s != mrg && s != cont && s != h).count();
-            if other < succ[b].len() && other <= 1 {
+            // a conditional branch to a break / continue and one other block needs no merge;
+            // a switch always does
+            if succ[b].len() <= 2 && other < succ[b].len() && other <= 1 {
                 continue; // break / continue
             }
         }
@@ -1805,11 +1807,13 @@ fn structure(m: &Module) -> Result<Structure, String> {
                     || split.iter().any(|(&h, &hs)| hs == b && module_switch(h))
             })
             .collect();
+        // a loop's merge or continue target is a break / continue, never a case construct
+        let loop_target: std::collections::HashSet<usize> = loops.iter().flat_map(|(h, &(_, cont))| [merge_of[h], cont]).collect();
         for b in switch_nodes {
             let own_merge = merge_of.get(&b).copied();
             for k in 0..vsucc[b].len() {
                 let t = vsucc[b][k];
-                if Some(t) == own_merge || dominates(b, t) {
+                if Some(t) == own_merge || (dominates(b, t) && !loop_target.contains(&t)) {
                     continue;
                 }
                 let x = vsucc.len();

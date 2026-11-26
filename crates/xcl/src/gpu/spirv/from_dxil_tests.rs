@@ -470,6 +470,15 @@ fn loop_exits_with_a_break_and_a_fallthrough() {
     dump("loop_exits_break_fallthrough", &words);
 }
 
+/// The same after `optimize`: the inner loop's exit 5 is now the outer loop's latch. Its exit
+/// switch has a break (7), a continue (5) and 6 as targets: a switch always needs a merge (a
+/// conditional branch to a break or continue does not), and a continue target is never a case.
+#[test]
+fn loop_exits_into_the_outer_latch() {
+    let succ = [vec![1], vec![2, 7], vec![3, 7], vec![4, 5], vec![2, 6], vec![1], vec![5], vec![]];
+    finish(cfg_module(&succ), "loop_exits_outer_latch");
+}
+
 /// A module with the control flow `succ` (block b branches to `succ[b]`: return, branch,
 /// conditional branch on a bit of the thread id, or a switch on it); every block stores.
 fn cfg_module(succ: &[Vec<usize>]) -> Shader {
@@ -511,7 +520,11 @@ fn cfg_module(succ: &[Vec<usize>]) -> Shader {
 fn cfg_from_file() {
     let Ok(path) = std::env::var("XCL_SPIRV_CFG") else { return };
     let succ: Vec<Vec<usize>> = std::fs::read_to_string(path).unwrap().lines().map(|l| l.split_whitespace().map(|x| x.parse().unwrap()).collect()).collect();
-    let s = cfg_module(&succ);
+    let mut s = cfg_module(&succ);
+    // `XCL_SPIRV_CFG_OPT=1`: through `optimize` first, as the translator's modules are
+    if std::env::var_os("XCL_SPIRV_CFG_OPT").is_some() {
+        s.m.optimize();
+    }
     let words = translate_compute(&s.m, [64, 1, 1]).unwrap_or_else(|e| panic!("cfg: {e}"));
     dump("cfg_file", &words);
 }
