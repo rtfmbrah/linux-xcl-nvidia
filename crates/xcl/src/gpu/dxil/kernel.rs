@@ -669,6 +669,12 @@ impl Lw {
                 crate::gpu::spirv::note_outcome("SPIR-V attached");
                 super::container::with_part(&c, *b"XSPV", &crate::gpu::spirv::xspv_part(numthreads, hw, words)).unwrap_or(c)
             }
+            // the direct DXIL path itself is experimental (GTA VI faults while loading with every
+            // program on it): with `XCL_SPIRV=1` only programs carrying SPIR-V take it, the others
+            // go the HLSL path (`XCL_SPIRV_DIRECT_ALL=1`: all of them as before)
+            _ if crate::gpu::spirv::live() && !crate::gpu::spirv::direct_all() => {
+                return Err("no checked SPIR-V for it (XCL_SPIRV=1 keeps such programs on the HLSL path)".into());
+            }
             _ => c,
         };
         Ok(Kernel { dxil: c, spirv, static_samplers: self.static_used.iter().map(|&(w, c, _)| (w, c)).collect(), dispatch_chain })

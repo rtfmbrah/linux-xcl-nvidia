@@ -23,6 +23,13 @@ pub fn live() -> bool {
     *ON.get_or_init(|| std::env::var("XCL_SPIRV").is_ok_and(|v| v.trim() == "1"))
 }
 
+/// `XCL_SPIRV_DIRECT_ALL=1`: with `XCL_SPIRV=1`, programs without SPIR-V take the direct DXIL
+/// path too (else they go the HLSL path).
+pub fn direct_all() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("XCL_SPIRV_DIRECT_ALL").is_ok_and(|v| v.trim() == "1"))
+}
+
 /// `XCL_SPIRV_ALLOW=<file>`: only programs whose DXIL container (FNV-1a 64 of its bytes, hex,
 /// one per line) is listed carry SPIR-V – those whose SPIR-V passed `spirv-val` offline
 /// (`xcl shaders --direct --spirv --dump`). NVIDIA's compiler crashes on invalid SPIR-V instead
