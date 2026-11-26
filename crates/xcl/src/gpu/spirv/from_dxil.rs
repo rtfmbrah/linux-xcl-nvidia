@@ -132,6 +132,11 @@ struct Tx<'a> {
     cur: usize,
     subst: Vec<(Vec<bool>, usize, u32)>,
     synth_ids: HashMap<(usize, u32), u32>,
+    /// blocks that only return: a branch to one goes to a return block of its own
+    /// (`branch_label`), so no construct has to leave through a block outside it
+    ret_only: Vec<bool>,
+    /// those return blocks, emitted after the others
+    extra_returns: Vec<u32>,
 }
 
 fn err<T>(msg: impl Into<String>) -> Result<T, String> {
@@ -139,6 +144,16 @@ fn err<T>(msg: impl Into<String>) -> Result<T, String> {
 }
 
 impl<'a> Tx<'a> {
+    /// The label a branch to node `x` takes (`ret_only`).
+    fn branch_label(&mut self, x: usize) -> u32 {
+        if self.ret_only.get(x).copied().unwrap_or(false) {
+            let l = self.w.id();
+            self.extra_returns.push(l);
+            return l;
+        }
+        self.labels[x]
+    }
+
     fn emit(&mut self, opcode: u16, ops: &[u32]) {
         self.body.push(((ops.len() as u32 + 1) << 16) | opcode as u32);
         self.body.extend_from_slice(ops);
@@ -2006,7 +2021,7 @@ fn dfs(succ: &[Vec<usize>]) -> (Vec<(usize, usize)>, Vec<usize>) {
 /// The terminator `term` (of a module block) as the end of node `b`, to `b`'s successors.
 fn emit_terminator(tx: &mut Tx, st: &Structure, b: usize, term: u32) -> Result<(), String> {
     let m = tx.m;
-    let tl: Vec<u32> = st.succ[b].iter().map(|&x| tx.labels[x]).collect();
+    let tl: Vec<u32> = st.succ[b].iter().map(|&x| tx.branch_label(x)).collect();
     match m.inst_op(term).clone() {
         Op::Br(_) => tx.emit(op::BRANCH, &[tl[0]]),
         Op::CondBr(c, _, _) => {
@@ -2056,6 +2071,8 @@ pub fn translate_compute(m: &Module, numthreads: [u32; 3]) -> Result<Vec<u32>, S
         cur: 0,
         subst: Vec::new(),
         synth_ids: HashMap::new(),
+        ret_only: (0..n).map(|b| matches!(m.block_insts(Block(b as u32)), [i] if matches!(m.inst_op(*i), Op::Ret))).collect(),
+        extra_returns: Vec::new(),
     };
     tx.w.capability(CAP_SHADER);
     tx.labels = (0..st.succ.len()).map(|_| tx.w.id()).collect();
@@ -2132,7 +2149,7 @@ pub fn translate_compute(m: &Module, numthreads: [u32; 3]) -> Result<Vec<u32>, S
                     tx.emit(op::SELECTION_MERGE, &[tx.labels[mrg], 0]);
                 }
                 let sel = synth_ids[&(b, key)];
-                let tl: Vec<u32> = st.succ[b].iter().map(|&x| tx.labels[x]).collect();
+                let tl: Vec<u32> = st.succ[b].iter().map(|&x| tx.branch_label(x)).collect();
                 let mut ops = vec![sel, *tl.last().unwrap()];
                 for (k, &l) in tl.iter().enumerate().take(tl.len() - 1) {
                     ops.push(k as u32);
@@ -2151,7 +2168,10 @@ pub fn translate_compute(m: &Module, numthreads: [u32; 3]) -> Result<Vec<u32>, S
                 continue;
             }
             match st.succ[b].first() {
-                Some(&t) => tx.emit(op::BRANCH, &[tx.labels[t]]),
+                Some(&t) => {
+                    let l = tx.branch_label(t);
+                    tx.emit(op::BRANCH, &[l]);
+                }
                 None => tx.emit(op::UNREACHABLE, &[]),
             }
             continue;
@@ -2182,6 +2202,10 @@ pub fn translate_compute(m: &Module, numthreads: [u32; 3]) -> Result<Vec<u32>, S
             continue;
         }
         emit_terminator(&mut tx, &st, b, *term)?;
+    }
+    for l in std::mem::take(&mut tx.extra_returns) {
+        tx.emit(op::LABEL, &[l]);
+        tx.emit(op::RETURN, &[]);
     }
 
     for (at, node, orig) in std::mem::take(&mut tx.pending_phis) {
