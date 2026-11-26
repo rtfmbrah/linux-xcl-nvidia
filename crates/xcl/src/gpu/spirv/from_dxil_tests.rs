@@ -457,6 +457,19 @@ fn join_after_a_loop_in_one_arm() {
     finish(cfg_module(&succ), "join_after_loop");
 }
 
+/// An inner loop (2-3-4) in an outer loop (1..7) leaves to three places, merged into one switch:
+/// out of the outer loop too (8, a break), to 5, and to 6, which runs on into 5 (shape of the
+/// biggest GTA VI compute programs). A switch case may not be a break (it gets a block of its
+/// own) and a case that runs on into another must come right before it in the target list.
+#[test]
+fn loop_exits_with_a_break_and_a_fallthrough() {
+    let succ = [vec![1], vec![2, 8], vec![3, 8], vec![4, 5], vec![2, 6], vec![7], vec![5], vec![1], vec![]];
+    // as built, without `optimize` (which reshapes this small graph)
+    let s = cfg_module(&succ);
+    let words = translate_compute(&s.m, [64, 1, 1]).unwrap_or_else(|e| panic!("{e}"));
+    dump("loop_exits_break_fallthrough", &words);
+}
+
 /// A module with the control flow `succ` (block b branches to `succ[b]`: return, branch,
 /// conditional branch on a bit of the thread id, or a switch on it); every block stores.
 fn cfg_module(succ: &[Vec<usize>]) -> Shader {

@@ -1362,6 +1362,10 @@ struct Structure {
     /// loop values used after a merged multi-exit loop: (loop body, merge node, instruction);
     /// outside the body the instruction reads as the merge node's phi for it
     subst: Vec<(Vec<bool>, usize, u32)>,
+    /// node that splits a switch's edge → the switch node (phi values there are as at the switch)
+    split_edges: HashMap<usize, usize>,
+    /// switch node → the order its cases (indices into its successors) are listed in
+    case_order: HashMap<usize, Vec<usize>>,
 }
 
 /// Finds loops (back edges of a DFS; one latch and one exit each) and selection merges (the
@@ -1778,12 +1782,132 @@ fn structure(m: &Module) -> Result<Structure, String> {
             merge_of.insert(h, x);
         }
     }
+    // a switch's targets must be case constructs it dominates (or its merge): a target it does
+    // not dominate (a break to an outer loop's merge, as merged loop exits switch to) gets a
+    // block of its own in between, from which the break is allowed
+    let mut split_edges: HashMap<usize, usize> = HashMap::new();
+    {
+        let idom = dominator_tree(&vsucc);
+        let dominates = |a: usize, mut x: usize| loop {
+            if x == a {
+                return true;
+            }
+            if x == 0 || idom[x] == usize::MAX || idom[x] == x {
+                return false;
+            }
+            x = idom[x];
+        };
+        let module_switch = |b: usize| b < m.block_count() && matches!(m.block_insts(Block(b as u32)).last().map(|&i| m.inst_op(i)), Some(Op::Switch(..)));
+        let switch_nodes: Vec<usize> = (0..vsucc.len())
+            .filter(|&b| {
+                switches.contains_key(&b)
+                    || (module_switch(b) && !split.contains_key(&b))
+                    || split.iter().any(|(&h, &hs)| hs == b && module_switch(h))
+            })
+            .collect();
+        for b in switch_nodes {
+            let own_merge = merge_of.get(&b).copied();
+            for k in 0..vsucc[b].len() {
+                let t = vsucc[b][k];
+                if Some(t) == own_merge || dominates(b, t) {
+                    continue;
+                }
+                let x = vsucc.len();
+                vsucc.push(vec![t]);
+                owner.push(b);
+                phis.push(Vec::new());
+                vsucc[b][k] = x;
+                for (_, list) in phis[t].iter_mut() {
+                    for e in list.iter_mut() {
+                        if e.1 == b {
+                            e.1 = x;
+                        }
+                    }
+                }
+                split_edges.insert(x, b);
+                let at = order.iter().position(|&o| o == b).map_or(order.len(), |i| i + 1);
+                order.insert(at, x);
+            }
+        }
+    }
+    // a case that runs on into another case (fallthrough) must come right before it in the
+    // switch's target list: the cases in chains of fallthroughs, else in their order
+    let mut case_order: HashMap<usize, Vec<usize>> = HashMap::new();
+    {
+        let idom = dominator_tree(&vsucc);
+        let dominates = |a: usize, mut x: usize| loop {
+            if x == a {
+                return true;
+            }
+            if x == 0 || idom[x] == usize::MAX || idom[x] == x {
+                return false;
+            }
+            x = idom[x];
+        };
+        let module_switch = |b: usize| b < m.block_count() && matches!(m.block_insts(Block(b as u32)).last().map(|&i| m.inst_op(i)), Some(Op::Switch(..)));
+        for b in 0..vsucc.len() {
+            // the targets' indices that are cases (the default is first in a module switch,
+            // last in a merged-exits switch)
+            let cases: Vec<usize> = if switches.contains_key(&b) {
+                (0..vsucc[b].len().saturating_sub(1)).collect()
+            } else if (module_switch(b) && !split.contains_key(&b)) || split.iter().any(|(&h, &hs)| hs == b && module_switch(h)) {
+                (1..vsucc[b].len()).collect()
+            } else {
+                continue;
+            };
+            let own_merge = merge_of.get(&b).copied();
+            let targets: Vec<usize> = cases.iter().map(|&k| vsucc[b][k]).collect();
+            // next[i] = j: case i runs on into case j
+            let mut next: Vec<Option<usize>> = vec![None; cases.len()];
+            let mut has_prev = vec![false; cases.len()];
+            for (i, &a) in targets.iter().enumerate() {
+                if Some(a) == own_merge {
+                    continue;
+                }
+                for x in 0..vsucc.len() {
+                    if !dominates(a, x) || own_merge.is_some_and(|mm| dominates(mm, x)) {
+                        continue;
+                    }
+                    for &c in &vsucc[x] {
+                        if let Some(j) = targets.iter().position(|&t| t == c && t != a && Some(t) != own_merge) {
+                            if next[i].is_none() && !has_prev[j] {
+                                next[i] = Some(j);
+                                has_prev[j] = true;
+                            }
+                        }
+                    }
+                }
+            }
+            if next.iter().all(Option::is_none) {
+                continue;
+            }
+            let mut order_k = Vec::with_capacity(cases.len());
+            let mut seen = vec![false; cases.len()];
+            for start in 0..cases.len() {
+                if has_prev[start] || seen[start] {
+                    continue;
+                }
+                let mut i = start;
+                loop {
+                    seen[i] = true;
+                    order_k.push(cases[i]);
+                    match next[i] {
+                        Some(j) if !seen[j] => i = j,
+                        _ => break,
+                    }
+                }
+            }
+            // cycles of fallthroughs cannot be ordered: whatever is left, in order
+            order_k.extend((0..cases.len()).filter(|&i| !seen[i]).map(|i| cases[i]));
+            case_order.insert(b, order_k);
+        }
+    }
     let mut loops_out = HashMap::new();
     for (h, (_, cont)) in loops {
         loops_out.insert(h, (merge_of[&h], cont));
     }
     let selections = sel_headers.iter().map(|&h| (h, merge_of[&h])).collect();
-    Ok(Structure { order, succ: vsucc, phis, loops: loops_out, selections, split, switches, subst })
+    Ok(Structure { order, succ: vsucc, phis, loops: loops_out, selections, split, switches, subst, split_edges, case_order })
 }
 
 /// A join `t` of a selection's arms that is not the selection's merge `M`: some path from the
@@ -2095,9 +2219,10 @@ fn emit_terminator(tx: &mut Tx, st: &Structure, b: usize, term: u32) -> Result<(
         Op::Switch(v, _, cases) => {
             let x = tx.id(v)?;
             let mut ops = vec![x, tl[0]];
-            for (k, (cv, _)) in cases.iter().enumerate() {
-                ops.push(m.const_u64(*cv).ok_or("switch case not constant")? as u32);
-                ops.push(tl[k + 1]);
+            let order: Vec<usize> = st.case_order.get(&b).cloned().unwrap_or_else(|| (1..=cases.len()).collect());
+            for k in order {
+                ops.push(m.const_u64(cases[k - 1].0).ok_or("switch case not constant")? as u32);
+                ops.push(tl[k]);
             }
             tx.emit(op::SWITCH, &ops);
         }
@@ -2215,9 +2340,10 @@ pub fn translate_compute(m: &Module, numthreads: [u32; 3]) -> Result<Vec<u32>, S
                 let sel = synth_ids[&(b, key)];
                 let tl: Vec<u32> = st.succ[b].iter().map(|&x| tx.branch_label(x)).collect();
                 let mut ops = vec![sel, *tl.last().unwrap()];
-                for (k, &l) in tl.iter().enumerate().take(tl.len() - 1) {
+                let order: Vec<usize> = st.case_order.get(&b).cloned().unwrap_or_else(|| (0..tl.len() - 1).collect());
+                for k in order {
                     ops.push(k as u32);
-                    ops.push(l);
+                    ops.push(tl[k]);
                 }
                 tx.emit(op::SWITCH, &ops);
                 continue;
@@ -2275,8 +2401,8 @@ pub fn translate_compute(m: &Module, numthreads: [u32; 3]) -> Result<Vec<u32>, S
     for (at, node, orig) in std::mem::take(&mut tx.pending_phis) {
         let list = st.phis[node].iter().find(|p| p.0 == orig).map(|p| p.1.clone()).unwrap_or_default();
         for (k, (val, from)) in list.into_iter().enumerate() {
-            // the value as it is at the end of the predecessor
-            tx.cur = from;
+            // the value as it is at the end of the predecessor (for an edge split, of the switch)
+            tx.cur = st.split_edges.get(&from).copied().unwrap_or(from);
             let id = match val {
                 PhiIn::Val(v) => tx.id(v)?,
                 PhiIn::Synth(x, o) => synth_ids[&(x, o)],
