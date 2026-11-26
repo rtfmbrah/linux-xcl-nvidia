@@ -174,18 +174,19 @@ fn translate_entry(
     nest: Option<super::compact::Nest>,
     tables: usize,
 ) -> Result<Kernel, String> {
-    // SPIR-V with several root UAV windows: the DXIL from the usual lowering, the SPIR-V from
-    // one whose windows are a single indexed root UAV (`spirv::ROOT_WINDOWS`)
-    let heap = o.mem_windows & crate::gpu::recomp::HEAP_WINDOWS != 0;
-    let windows = o.mem_windows & !(crate::gpu::recomp::HEAP_WINDOWS | crate::gpu::spirv::ROOT_WINDOWS | crate::gpu::spirv::NO_SPIRV);
-    let dual = crate::gpu::spirv::wanted() && !heap && windows > 1 && o.mem_windows & crate::gpu::spirv::NO_SPIRV == 0
-        && matches!(entry, Entry::Kernel | Entry::Compute(_));
+    // SPIR-V with several memory windows: the DXIL from the usual lowering (root or heap
+    // windows), the SPIR-V from one whose windows are a single indexed root UAV
+    // (`spirv::ROOT_WINDOWS`; the runtime binds the windows as root UAVs u2.. either way)
+    let flags = crate::gpu::recomp::HEAP_WINDOWS | crate::gpu::spirv::ROOT_WINDOWS | crate::gpu::spirv::NO_SPIRV;
+    let windows = o.mem_windows & !flags;
+    let dual = crate::gpu::spirv::wanted() && windows > 1 && windows as usize <= crate::gpu::uma::MAX_WINDOWS
+        && o.mem_windows & crate::gpu::spirv::NO_SPIRV == 0 && matches!(entry, Entry::Kernel | Entry::Compute(_));
     if !dual {
         return translate_entry_forms(code, o, entry, compact, nest, tables).map(|k| k.0);
     }
     let (mut k, form) = translate_entry_forms(code, KernelOptions { mem_windows: o.mem_windows | crate::gpu::spirv::NO_SPIRV, ..o }, entry.clone(), compact, nest, tables)?;
     if k.dispatch_chain.is_none() && k.xspv.is_some() {
-        let r = translate_entry_once(code, KernelOptions { mem_windows: o.mem_windows | crate::gpu::spirv::ROOT_WINDOWS, ..o }, entry, form, nest, tables);
+        let r = translate_entry_once(code, KernelOptions { mem_windows: windows | crate::gpu::spirv::ROOT_WINDOWS, ..o }, entry, form, nest, tables);
         k.spirv = match r {
             Ok(s) => s.spirv,
             Err(e) => Some(Err(e)),
