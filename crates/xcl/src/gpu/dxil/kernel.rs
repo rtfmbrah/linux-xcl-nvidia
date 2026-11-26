@@ -765,6 +765,9 @@ fn attach_spirv(k: Kernel) -> Result<Kernel, String> {
             let dxil = super::container::with_part(&k.dxil, *b"XSPV", &part).unwrap_or_else(|| k.dxil.clone());
             Ok(Kernel { dxil, ..k })
         }
+        // a program split into a dispatch chain keeps its pieces: as one program on the HLSL
+        // path the biggest ones took 35-56 s each in NVIDIA's compiler during a world load
+        _ if k.dispatch_chain.is_some() => Ok(k),
         // the direct DXIL path itself is experimental (GTA VI faults while loading with every
         // program on it): with `XCL_SPIRV=1` only programs carrying SPIR-V take it, the others
         // go the HLSL path (`XCL_SPIRV_DIRECT_ALL=1`: all of them as before)
