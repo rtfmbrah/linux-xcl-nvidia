@@ -855,6 +855,21 @@ impl<'a> Tx<'a> {
                     }
                 })
             }
+            54..=56 => {
+                // Dot2 / Dot3 / Dot4 (a0.., b0..): products summed in order
+                let n = (opcode - 52) as usize;
+                let t = self.ty(rty)?;
+                let mut acc = None;
+                for k in 0..n {
+                    let (x, y) = (self.id(a[k])?, self.id(a[n + k])?);
+                    let p = self.op2(133, t, x, y); // FMul
+                    acc = Some(match acc {
+                        Some(s) => self.op2(129, t, s, p), // FAdd
+                        None => p,
+                    });
+                }
+                Val::Id(acc.ok_or("dot without operands")?)
+            }
             51 | 52 => {
                 // Ibfe / Ubfe(width, offset, value) with D3D's rules for width/offset
                 let (w0, o0, v) = (self.id(a[0])?, self.id(a[1])?, self.id(a[2])?);

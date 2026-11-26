@@ -375,3 +375,74 @@ fn heap_textures() {
     s.texture_store(u, &[x, y], out);
     finish(s, "heap_textures");
 }
+
+/// out[tid] = dot3(in[tid*3..], in[tid*3..]) as uint: dx.op.dot3 as multiplies and adds
+#[test]
+fn dot3() {
+    use crate::gpu::dxil::module::{CastOp, FnAttrs};
+    let mut s = Shader::new(Stage::Compute, (6, 6));
+    let input = s.raw_uav(0, 0);
+    let output = s.raw_uav(1, 0);
+    let tid = s.thread_id(0);
+    let twelve = s.m.i32c(12);
+    let off = s.m.bin(BinOp::Mul, tid, twelve);
+    let v = s.raw_load(input, off, 7);
+    let f32 = s.m.f32();
+    let f: Vec<_> = v.iter().map(|&x| s.m.cast(CastOp::UIToFP, x, f32)).collect();
+    let d = s.op(55, "dot3", Some(f32), f32, &[f[0], f[1], f[2], f[0], f[1], f[2]], FnAttrs::ReadNone);
+    let i32 = s.m.i32();
+    let u = s.m.cast(CastOp::FPToUI, d, i32);
+    let four = s.m.i32c(4);
+    let o = s.m.bin(BinOp::Mul, tid, four);
+    s.raw_store(output, o, &[u]);
+    let words = finish(s, "dot3");
+    let mut fmul = 0;
+    let mut i = 5;
+    while i < words.len() {
+        if words[i] & 0xffff == 133 {
+            fmul += 1;
+        }
+        i += (words[i] >> 16).max(1) as usize;
+    }
+    assert_eq!(fmul, 3, "three products");
+}
+
+/// One block only returns and is reached from the entry, from a nested selection and after
+/// both: every branch to it gets a return of its own (valid structure for spirv-val).
+#[test]
+fn shared_return_block() {
+    let mut s = Shader::new(Stage::Compute, (6, 6));
+    let output = s.raw_uav(1, 0);
+    let tid = s.thread_id(0);
+    let four = s.m.i32c(4);
+    let off = s.m.bin(BinOp::Mul, tid, four);
+    let (a, b, c, r) = (s.m.new_block(), s.m.new_block(), s.m.new_block(), s.m.new_block());
+    let k32 = s.m.i32c(32);
+    let c1 = s.m.cmp(Pred::ULt, tid, k32);
+    s.m.cond_br(c1, a, r);
+    s.m.set_block(a);
+    let k16 = s.m.i32c(16);
+    let c2 = s.m.cmp(Pred::ULt, tid, k16);
+    s.m.cond_br(c2, b, c);
+    s.m.set_block(b);
+    let k8 = s.m.i32c(8);
+    let c3 = s.m.cmp(Pred::ULt, tid, k8);
+    s.m.cond_br(c3, r, c);
+    s.m.set_block(c);
+    s.raw_store(output, off, &[tid]);
+    s.m.br(r);
+    s.m.set_block(r);
+    s.m.ret();
+    let words = finish(s, "shared_return");
+    let returns = {
+        let (mut n, mut i) = (0, 5);
+        while i < words.len() {
+            if words[i] & 0xffff == 253 {
+                n += 1;
+            }
+            i += (words[i] >> 16).max(1) as usize;
+        }
+        n
+    };
+    assert!(returns >= 3, "a return per branch to the shared block, got {returns}");
+}
