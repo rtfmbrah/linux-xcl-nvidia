@@ -446,3 +446,59 @@ fn shared_return_block() {
     };
     assert!(returns >= 3, "a return per branch to the shared block, got {returns}");
 }
+
+/// Control flow reduced from a GTA VI compute program: the loop 3-4-5 in one arm of the
+/// selection at 1 has its latch 5 only loop back, and leaves to 6 or into the other arm (2).
+/// The latch must count as going on to the loop's exit when merges are chosen; as a dead end
+/// it made the selection seem to have no merge (spirv-val: "exits the selection").
+#[test]
+fn join_after_a_loop_in_one_arm() {
+    let succ = [vec![1], vec![2, 3], vec![6], vec![6, 4], vec![5, 2], vec![3], vec![]];
+    finish(cfg_module(&succ), "join_after_loop");
+}
+
+/// A module with the control flow `succ` (block b branches to `succ[b]`: return, branch,
+/// conditional branch on a bit of the thread id, or a switch on it); every block stores.
+fn cfg_module(succ: &[Vec<usize>]) -> Shader {
+    let mut s = Shader::new(Stage::Compute, (6, 6));
+    let output = s.raw_uav(0, 0);
+    let tid = s.thread_id(0);
+    let four = s.m.i32c(4);
+    let off = s.m.bin(BinOp::Mul, tid, four);
+    let mut blocks = vec![s.m.current_block()];
+    for _ in 1..succ.len() {
+        blocks.push(s.m.new_block());
+    }
+    for (b, ss) in succ.iter().enumerate() {
+        s.m.set_block(blocks[b]);
+        let k = s.m.i32c(b as u32);
+        s.raw_store(output, off, &[k]);
+        match ss[..] {
+            [] => s.m.ret(),
+            [t] => s.m.br(blocks[t]),
+            [t, f] => {
+                let bit = s.m.i32c(1 << (b % 6));
+                let x = s.m.bin(BinOp::And, tid, bit);
+                let zero = s.m.i32c(0);
+                let c = s.m.cmp(Pred::Eq, x, zero);
+                s.m.cond_br(c, blocks[t], blocks[f]);
+            }
+            _ => {
+                let cases: Vec<_> = ss[1..].iter().enumerate().map(|(i, &t)| (s.m.i32c(i as u32), blocks[t])).collect();
+                s.m.switch(tid, blocks[ss[0]], &cases);
+            }
+        }
+    }
+    s
+}
+
+/// `XCL_SPIRV_CFG=<file>` (lines of successors, as `XCL_SPIRV_CFG_DUMP` writes them): that
+/// control flow translated and dumped as `cfg_file.spv` (for reducing a failing shape).
+#[test]
+fn cfg_from_file() {
+    let Ok(path) = std::env::var("XCL_SPIRV_CFG") else { return };
+    let succ: Vec<Vec<usize>> = std::fs::read_to_string(path).unwrap().lines().map(|l| l.split_whitespace().map(|x| x.parse().unwrap()).collect()).collect();
+    let s = cfg_module(&succ);
+    let words = translate_compute(&s.m, [64, 1, 1]).unwrap_or_else(|e| panic!("cfg: {e}"));
+    dump("cfg_file", &words);
+}

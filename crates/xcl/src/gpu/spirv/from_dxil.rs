@@ -1372,6 +1372,10 @@ struct Structure {
 fn structure(m: &Module) -> Result<Structure, String> {
     let n0 = m.block_count();
     let mut succ: Vec<Vec<usize>> = (0..n0).map(|b| successors(m, Block(b as u32)).iter().map(|x| x.0 as usize).collect()).collect();
+    if let Ok(path) = std::env::var("XCL_SPIRV_CFG_DUMP") {
+        // debugging aid: the module's control flow, one block's successors per line
+        let _ = std::fs::write(path, succ.iter().map(|ss| ss.iter().map(|x| x.to_string()).collect::<Vec<_>>().join(" ") + "\n").collect::<String>());
+    }
     let mut phis: Vec<Vec<(u32, Vec<(PhiIn, usize)>)>> = (0..n0)
         .map(|b| {
             m.block_insts(Block(b as u32))
@@ -1570,6 +1574,7 @@ fn structure(m: &Module) -> Result<Structure, String> {
     // loops
     let mut loops: HashMap<usize, (usize, usize)> = HashMap::new();
     let mut loop_of: Vec<Option<usize>> = vec![None; n];
+    let mut bodies: HashMap<usize, Vec<bool>> = HashMap::new();
     let mut headers: Vec<usize> = back.iter().map(|e| e.1).collect();
     headers.sort_by_key(|&h| rank[h]);
     headers.dedup();
@@ -1600,6 +1605,7 @@ fn structure(m: &Module) -> Result<Structure, String> {
                 loop_of[x] = Some(h);
             }
         }
+        bodies.insert(h, body);
     }
     let fsucc = |b: usize| -> Vec<usize> { succ[b].iter().copied().filter(|&s| !is_back(b, s)).collect() };
     // immediate post-dominators over the forward graph (`n` = virtual exit) and dominators
@@ -1624,20 +1630,29 @@ fn structure(m: &Module) -> Result<Structure, String> {
         }
         x
     };
-    let mut ipdom = vec![usize::MAX; n + 1];
-    ipdom[n] = n;
-    for &b in topo.iter().rev() {
-        let mut new = usize::MAX;
-        let mut ss = fsucc(b);
-        if ss.is_empty() {
-            ss.push(n);
-        }
-        for s in ss {
-            if ipdom[s] != usize::MAX {
-                new = if new == usize::MAX { s } else { meet(&ipdom, new, s, true) };
+    // a latch goes on to its loop's merge (as in `ladder_partial_joins`), not to the program's
+    // end: else a selection with a loop in an arm seems to have no merge
+    let pfwd: Vec<Vec<usize>> = (0..n)
+        .map(|b| {
+            let mut ss = fsucc(b);
+            if let Some(&(mrg, latch)) = succ[b].iter().find(|&&s| is_back(b, s)).and_then(|h| loops.get(h)) {
+                if latch == b && !ss.contains(&mrg) {
+                    ss.push(mrg);
+                }
+            }
+            ss
+        })
+        .collect();
+    let mut ipdom = post_dominator_tree(&pfwd);
+    ipdom.push(n);
+    // inside a loop, a merge outside it is no merge: the arms leave by break / continue
+    for b in 0..n {
+        if let Some(h) = loop_of[b] {
+            let p = ipdom[b];
+            if p < n && !bodies[&h][p] {
+                ipdom[b] = n;
             }
         }
-        ipdom[b] = new;
     }
     let mut idom = vec![usize::MAX; n];
     idom[0] = 0;
@@ -1779,6 +1794,15 @@ fn structure(m: &Module) -> Result<Structure, String> {
 /// phi to `t` or `M` (and carries their phis); it becomes the merge of the selection.
 /// Only joins whose region `t` is entered through `t` alone and that sit with `A` and `M` in
 /// the same loop are rewritten; the others stay for `spirv-val` to refuse.
+fn ltrace(line: String) {
+    if let Ok(path) = std::env::var("XCL_SPIRV_TRACE") {
+        use std::io::Write;
+        if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
+            let _ = writeln!(f, "{line}");
+        }
+    }
+}
+
 fn ladder_partial_joins(succ: &mut Vec<Vec<usize>>, phis: &mut Vec<Vec<(u32, Vec<(PhiIn, usize)>)>>, switches: &mut HashMap<usize, u32>) {
     for _ in 0..1024 {
         let n = succ.len();
@@ -1806,6 +1830,7 @@ fn ladder_partial_joins(succ: &mut Vec<Vec<usize>>, phis: &mut Vec<Vec<(u32, Vec
         let mut headers: Vec<usize> = back.iter().map(|e| e.1).collect();
         headers.sort_unstable();
         headers.dedup();
+        let mut loop_exit: HashMap<usize, usize> = HashMap::new();
         for &h in &headers {
             let mut body = vec![false; n];
             body[h] = true;
@@ -1817,6 +1842,12 @@ fn ladder_partial_joins(succ: &mut Vec<Vec<usize>>, phis: &mut Vec<Vec<(u32, Vec
                 }
             }
             let count = body.iter().filter(|&&x| x).count();
+            let mut exits: Vec<usize> = (0..n).filter(|&x| body[x]).flat_map(|x| succ[x].iter().copied()).filter(|&s| !body[s]).collect();
+            exits.sort_unstable();
+            exits.dedup();
+            if let [e] = exits[..] {
+                loop_exit.insert(h, e);
+            }
             for x in 0..n {
                 if body[x] {
                     if count < size[x] {
@@ -1836,7 +1867,17 @@ fn ladder_partial_joins(succ: &mut Vec<Vec<usize>>, phis: &mut Vec<Vec<(u32, Vec
             special[e.0] = true;
         }
         let idom = dominator_tree(succ);
-        let ipdom = post_dominator_tree(&fwd);
+        // post-dominators where a latch goes on to its loop's exit: else every latch is a sink
+        // like the program's end, and a selection with a loop in an arm seems to have no merge
+        let mut pfwd = fwd.clone();
+        for &(l, h) in &back {
+            if let Some(&e) = loop_exit.get(&h) {
+                if !pfwd[l].contains(&e) {
+                    pfwd[l].push(e);
+                }
+            }
+        }
+        let ipdom = post_dominator_tree(&pfwd);
         let dominates = |a: usize, mut x: usize| loop {
             if x == a {
                 return true;
@@ -1849,11 +1890,15 @@ fn ladder_partial_joins(succ: &mut Vec<Vec<usize>>, phis: &mut Vec<Vec<(u32, Vec
         let mut done = false;
         for t in 0..n {
             if preds[t].len() < 2 || special[t] || idom[t] == usize::MAX {
+                if preds[t].len() >= 2 {
+                    ltrace(format!("t {t} skip: special {} idom {}", special[t], idom[t]));
+                }
                 continue;
             }
             let a = idom[t];
             let mm = ipdom[a];
             if mm >= n || mm == t || special[a] || loop_of[a] != loop_of[t] || loop_of[mm] != loop_of[t] {
+                ltrace(format!("t {t} a {a} mm {mm} skip: mm>=n {} mm==t {} special[a] {} loop a/t/mm {:?}/{:?}/{:?}", mm >= n, mm == t, special[a], loop_of[a], loop_of[t], loop_of.get(mm)));
                 continue;
             }
             // t's region: everything reached from t before M; entered through t only
@@ -1865,12 +1910,14 @@ fn ladder_partial_joins(succ: &mut Vec<Vec<usize>>, phis: &mut Vec<Vec<(u32, Vec
                     work.extend(fwd[x].iter().copied());
                 }
             }
-            if (0..n).any(|c| cut[c] && c != t && preds[c].iter().any(|&p| !cut[p])) {
+            if let Some(c) = (0..n).find(|&c| cut[c] && c != t && preds[c].iter().any(|&p| !cut[p])) {
+                ltrace(format!("t {t} a {a} mm {mm} skip: region entered at {c} from {:?}", preds[c].iter().filter(|&&p| !cut[p]).collect::<Vec<_>>()));
                 continue;
             }
             let from_t = preds[t].clone();
             let from_m: Vec<usize> = preds[mm].iter().copied().filter(|&p| !cut[p] && dominates(a, p)).collect();
             if from_m.is_empty() {
+                ltrace(format!("t {t} a {a} mm {mm} skip: no edge into M from outside t's region"));
                 continue;
             }
             // a block that branches to both (a merged loop exit whose empty block LLVM removed):
@@ -1896,8 +1943,10 @@ fn ladder_partial_joins(succ: &mut Vec<Vec<usize>>, phis: &mut Vec<Vec<(u32, Vec
                 break;
             }
             if phis[t].iter().any(|(o, _)| phis[mm].iter().any(|(o2, _)| o == o2)) {
+                ltrace(format!("t {t} a {a} mm {mm} skip: t and M share a phi"));
                 continue;
             }
+            ltrace(format!("t {t} a {a} mm {mm} laddered"));
             let j = succ.len();
             let key = SELECTOR + switches.len() as u32;
             succ.push(vec![t, mm]);
