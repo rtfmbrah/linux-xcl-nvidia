@@ -299,10 +299,18 @@ impl<'a> Tx<'a> {
     /// descriptor `lower`) when it does not lower root descriptors to SSBOs. A pointer to a
     /// `uint data[]` block of its own (`NonWritable` / `NonReadable` go on its member).
     fn root_buffer(&mut self, space: u32, lower: u32) -> Result<u32, String> {
-        if space != 0 || lower >= 16 {
-            return err(format!("root UAV u{lower} in space {space}"));
+        self.root_buffer_at(space, lower, lower, None)
+    }
+
+    /// Root UAV `u<lower>` (or, with `index`, the one of `u<lower>..=u<upper>` it names): a
+    /// pointer from the buffer address in the push constants.
+    fn root_buffer_at(&mut self, space: u32, lower: u32, upper: u32, index: Option<u32>) -> Result<u32, String> {
+        if space != 0 || upper >= 16 || lower > upper {
+            return err(format!("root UAV u{lower}..u{upper} in space {space}"));
         }
-        self.root_uavs |= 1 << lower;
+        for k in lower..=upper {
+            self.root_uavs |= 1 << k;
+        }
         let u = self.uint();
         let uv2 = self.w.vector(u, 2);
         let push = match self.push_var {
@@ -313,7 +321,9 @@ impl<'a> Tx<'a> {
                 v
             }
         };
-        let st = match self.buffers.get(&(0x7000_0000, lower)) {
+        // one block type per root UAV, and one per indexed range (their access decorations differ)
+        let key = if index.is_some() { 0x7100_0000 | upper << 8 | lower } else { lower };
+        let st = match self.buffers.get(&(0x7000_0000, key)) {
             Some(&st) => st,
             None => {
                 let arr = self.w.ty(op::TYPE_RUNTIME_ARRAY, &[u]);
@@ -323,15 +333,20 @@ impl<'a> Tx<'a> {
                 let st = self.w.distinct_type(op::TYPE_STRUCT, &[arr]);
                 self.w.decorate(st, DEC_BLOCK, &[]);
                 self.w.member_decorate(st, 0, DEC_OFFSET, &[0]);
-                self.buffers.insert((0x7000_0000, lower), st);
+                self.buffers.insert((0x7000_0000, key), st);
                 self.psb_blocks.insert(st);
                 st
             }
         };
+        // the push block is `uvec2[n]` (member 0): a computed index needs an array
         let ppc = self.w.pointer(SC_PUSH_CONSTANT, uv2);
-        let k = self.w.constant_u32(lower);
+        let zero = self.w.constant_u32(0);
+        let k = match index {
+            Some(i) => i,
+            None => self.w.constant_u32(lower),
+        };
         let p = self.w.id();
-        self.emit(op::ACCESS_CHAIN, &[ppc, p, push, k]);
+        self.emit(op::ACCESS_CHAIN, &[ppc, p, push, zero, k]);
         let addr = self.w.id();
         self.emit(op::LOAD, &[uv2, addr, p]);
         let pst = self.w.pointer(SC_PHYSICAL_STORAGE_BUFFER, st);
@@ -443,6 +458,12 @@ impl<'a> Tx<'a> {
                     return err(format!("createHandleFromBinding: resource class {class} (only UAVs)"));
                 }
                 let (lower, space) = (self.m.const_u64(parts[0]).unwrap_or(0) as u32, self.m.const_u64(parts[2]).unwrap_or(0) as u32);
+                if self.m.const_u64(a[1]).is_none() {
+                    // a computed index into a range of root UAVs (`Shader::raw_uav_indexed`)
+                    let upper = self.m.const_u64(parts[1]).unwrap_or(0) as u32;
+                    let index = self.id(a[1])?;
+                    return Ok(Val::Buffer(self.root_buffer_at(space, lower, upper, Some(index))?));
+                }
                 let index = c(self, 1)?;
                 Val::Buffer(self.root_buffer(space, index.max(lower))?)
             }
@@ -2203,11 +2224,12 @@ pub fn translate_compute(m: &Module, numthreads: [u32; 3]) -> Result<Vec<u32>, S
         let n = 32 - tx.root_uavs.leading_zeros();
         let u = tx.uint();
         let uv2 = tx.w.vector(u, 2);
-        let st = tx.w.distinct_type(op::TYPE_STRUCT, &vec![uv2; n as usize]);
+        let len = tx.w.constant_u32(n);
+        let arr = tx.w.distinct_type(op::TYPE_ARRAY, &[uv2, len]);
+        tx.w.decorate(arr, DEC_ARRAY_STRIDE, &[8]);
+        let st = tx.w.distinct_type(op::TYPE_STRUCT, &[arr]);
         tx.w.decorate(st, DEC_BLOCK, &[]);
-        for i in 0..n {
-            tx.w.member_decorate(st, i, DEC_OFFSET, &[8 * i]);
-        }
+        tx.w.member_decorate(st, 0, DEC_OFFSET, &[0]);
         let pt = tx.w.pointer(SC_PUSH_CONSTANT, st);
         tx.w.emit(Section::Globals, op::VARIABLE, &[pt, push, SC_PUSH_CONSTANT]);
         tx.interface.push(push);

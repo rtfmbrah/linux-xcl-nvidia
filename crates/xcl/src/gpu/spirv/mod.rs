@@ -8,6 +8,15 @@
 
 pub mod from_dxil;
 
+/// Flag in `KernelOptions::mem_windows` for the direct translator's own runs: the memory windows
+/// are one root UAV of u2.. indexed by the window at each access, as the descriptor heap
+/// windows (`Lw::window_uav`). With buffer device addresses that is one access instead of a
+/// `switch` over the windows, which NVIDIA's compiler builds several times faster. The module
+/// is only translated to SPIR-V (D3D12 has no root descriptor ranges).
+pub const ROOT_WINDOWS: u32 = 0x200;
+/// Flag in `KernelOptions::mem_windows`: no SPIR-V from this run (a `ROOT_WINDOWS` run makes it).
+pub const NO_SPIRV: u32 = 0x400;
+
 static WANTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// Whether the direct translator also makes SPIR-V of compute entries (`xcl shaders --spirv`,

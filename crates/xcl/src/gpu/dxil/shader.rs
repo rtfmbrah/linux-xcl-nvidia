@@ -291,6 +291,23 @@ impl Shader {
         RawUav { handle, binding: Some(id) }
     }
 
+    /// Raw UAV `u<index>` of the `count` root UAVs from `u<lower>`, space 0, with a computed
+    /// index (`Lw::window_uav` with `root_windows`). D3D12 cannot bind root descriptors as a
+    /// range: such a module is only translated to SPIR-V, never compiled as DXIL.
+    pub(super) fn raw_uav_indexed(&mut self, lower: u32, count: u32, index: Value, coherent: bool) -> RawUav {
+        self.require(Feature::RawAndStructuredBuffers);
+        let i32 = self.m.i32();
+        let i8 = self.m.i8();
+        let bind_ty = self.m.named_struct("dx.types.ResBind", &[i32, i32, i32, i8]);
+        let (lo, hi, sp, cl) = (self.m.i32c(lower), self.m.i32c(lower + count - 1), self.m.i32c(0), self.m.i8c(ResClass::Uav as u8));
+        let bind = self.m.aggregate(bind_ty, &[lo, hi, sp, cl]);
+        let nonuniform = self.m.i1c(false);
+        let ht = self.handle_ty;
+        let h = self.op(217, "createHandleFromBinding", None, ht, &[bind, index, nonuniform], FnAttrs::ReadNone);
+        let handle = self.annotate(h, kind::RAW_BUFFER | 0x1000 | if coherent { 0x4000 } else { 0 }, 0);
+        RawUav { handle, binding: None }
+    }
+
     pub(super) fn handle_from_binding(&mut self, class: ResClass, lower: u32, upper: u32, space: u32, index: u32) -> Value {
         let i32 = self.m.i32();
         let i8 = self.m.i8();

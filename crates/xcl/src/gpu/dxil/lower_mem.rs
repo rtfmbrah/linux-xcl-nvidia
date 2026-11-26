@@ -152,6 +152,18 @@ pub struct FmtComp1 {
 }
 
 impl Lw {
+    /// The raw UAV of window `w` when the windows are picked per access (`heap_mem`): descriptor
+    /// `MEM_HEAP_BASE + w` of the heap, or with `root_windows` root UAV `u<2 + w>`.
+    pub(crate) fn window_uav(&mut self, w: Value, coherent: bool) -> RawUav {
+        if self.root_windows {
+            let n = self.mems.len() as u32;
+            let i = self.addc(w, 2);
+            return self.s.raw_uav_indexed(2, n, i, coherent);
+        }
+        let i = self.addc(w, crate::gpu::recomp::MEM_HEAP_BASE);
+        self.s.heap_raw_buffer_uav(i, coherent)
+    }
+
     /// Runs `f` on the active memory window (`mem`, `mem1`.. at u2.., or descriptor heap
     /// when `self.heap_mem` is set via `XCL_HEAP_WINDOWS`), returning `out_tys.len()` values
     /// merged across the window arms via a single `switch` (or single guarded heap lookup)
@@ -184,8 +196,7 @@ impl Lw {
                 return out_tys.iter().map(|&t| self.s.m.const_int(t, 0)).collect();
             }
             if self.s.m.const_u64(cond) == Some(1) {
-                let i = self.addc(w, crate::gpu::recomp::MEM_HEAP_BASE);
-                let m = self.s.heap_raw_buffer_uav(i, coherent);
+                let m = self.window_uav(w, coherent);
                 let vals = f(self, m);
                 debug_assert_eq!(vals.len(), out_tys.len());
                 return vals;
@@ -198,8 +209,7 @@ impl Lw {
             self.s.m.set_block(then);
             #[cfg(debug_assertions)]
             self.ssa.begin_log();
-            let i = self.addc(w, crate::gpu::recomp::MEM_HEAP_BASE);
-            let m = self.s.heap_raw_buffer_uav(i, coherent);
+            let m = self.window_uav(w, coherent);
             let vals = f(self, m);
             #[cfg(debug_assertions)]
             debug_assert!(self.ssa.end_log().is_empty(), "with_mem closure wrote SSA var");

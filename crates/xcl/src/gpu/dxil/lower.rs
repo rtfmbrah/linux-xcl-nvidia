@@ -187,6 +187,11 @@ pub struct Lw {
     /// the windows come from the descriptor heap (`lower_window`; `mems` only counts them):
     /// Some(globallycoherent)
     pub heap_mem: Option<bool>,
+    /// `heap_mem` windows are root UAVs u2.. indexed by the window (`spirv::ROOT_WINDOWS`:
+    /// a module only translated to SPIR-V, which reads them by buffer device address)
+    pub root_windows: bool,
+    /// no SPIR-V from this module (`spirv::NO_SPIRV`: another lowering makes it)
+    pub no_spirv: bool,
     pub res: Option<RawUav>,
     /// the buffer format table (`FMT_INFO`), created on first use
     pub fmt_table: Option<Value>,

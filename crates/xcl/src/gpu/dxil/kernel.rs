@@ -68,6 +68,8 @@ pub struct Kernel {
     pub spirv: Option<Result<Vec<u32>, String>>,
     pub static_samplers: Vec<([u32; 4], bool)>,
     pub dispatch_chain: Option<std::sync::Arc<DispatchChain>>,
+    /// a compute entry's workgroup size and hardware wave size (the `XSPV` header)
+    pub xspv: Option<([u32; 3], u32)>,
 }
 
 pub use super::module::split::DispatchChain;
@@ -172,18 +174,48 @@ fn translate_entry(
     nest: Option<super::compact::Nest>,
     tables: usize,
 ) -> Result<Kernel, String> {
+    // SPIR-V with several root UAV windows: the DXIL from the usual lowering, the SPIR-V from
+    // one whose windows are a single indexed root UAV (`spirv::ROOT_WINDOWS`)
+    let heap = o.mem_windows & crate::gpu::recomp::HEAP_WINDOWS != 0;
+    let windows = o.mem_windows & !(crate::gpu::recomp::HEAP_WINDOWS | crate::gpu::spirv::ROOT_WINDOWS | crate::gpu::spirv::NO_SPIRV);
+    let dual = crate::gpu::spirv::wanted() && !heap && windows > 1 && o.mem_windows & crate::gpu::spirv::NO_SPIRV == 0
+        && matches!(entry, Entry::Kernel | Entry::Compute(_));
+    if !dual {
+        return translate_entry_forms(code, o, entry, compact, nest, tables).map(|k| k.0);
+    }
+    let (mut k, form) = translate_entry_forms(code, KernelOptions { mem_windows: o.mem_windows | crate::gpu::spirv::NO_SPIRV, ..o }, entry.clone(), compact, nest, tables)?;
+    if k.dispatch_chain.is_none() && k.xspv.is_some() {
+        let r = translate_entry_once(code, KernelOptions { mem_windows: o.mem_windows | crate::gpu::spirv::ROOT_WINDOWS, ..o }, entry, form, nest, tables);
+        k.spirv = match r {
+            Ok(s) => s.spirv,
+            Err(e) => Some(Err(e)),
+        };
+    }
+    attach_spirv(k)
+}
+
+/// `translate_entry_once`, retried in the compact form when the plain one is over
+/// `XCL_DIRECT_COMPACT_KB`; with the form kept (as `compact` to pass for the same form).
+fn translate_entry_forms(
+    code: &[u8],
+    o: KernelOptions,
+    entry: Entry,
+    compact: Option<bool>,
+    nest: Option<super::compact::Nest>,
+    tables: usize,
+) -> Result<(Kernel, Option<bool>), String> {
     let retry = compact.is_none() && matches!(entry, Entry::Kernel | Entry::Compute(_));
     let plain = translate_entry_once(code, o, entry.clone(), compact, nest, tables)?;
     let over = compact_over_bytes();
     if !retry || over == 0 || plain.dxil.len() <= over {
-        return Ok(plain);
+        return Ok((plain, compact));
     }
     match translate_entry_once(code, o, entry, Some(true), nest, tables) {
         Ok(c) if c.dxil.len() < plain.dxil.len() => {
             crate::xlog_info!("[SHADER] direct DXIL: {} B plain over XCL_DIRECT_COMPACT_KB, {} B compact kept", plain.dxil.len(), c.dxil.len());
-            Ok(c)
+            Ok((c, Some(true)))
         }
-        _ => Ok(plain),
+        _ => Ok((plain, compact)),
     }
 }
 
@@ -217,8 +249,10 @@ fn translate_entry_once(
 fn mem_windows(s: &mut Shader, mem_windows: u32, coherent: bool) -> (Vec<RawUav>, Option<bool>) {
     let heap = mem_windows & crate::gpu::recomp::HEAP_WINDOWS != 0;
     let max = if heap { crate::gpu::uma::MAX_HEAP_WINDOWS as u32 } else { crate::gpu::uma::MAX_WINDOWS as u32 };
-    let n = (mem_windows & !crate::gpu::recomp::HEAP_WINDOWS).clamp(1, max);
-    if heap && n > 1 {
+    let n = (mem_windows & !(crate::gpu::recomp::HEAP_WINDOWS | crate::gpu::spirv::ROOT_WINDOWS | crate::gpu::spirv::NO_SPIRV)).clamp(1, max);
+    // `spirv::ROOT_WINDOWS`: the windows are picked per access like heap windows, as one root
+    // UAV of u2.. indexed by the window (`Lw::window_uav`)
+    if (heap || mem_windows & crate::gpu::spirv::ROOT_WINDOWS != 0) && n > 1 {
         let z = s.m.i32c(0);
         return (vec![RawUav { handle: z, binding: None }; n as usize], Some(coherent));
     }
@@ -556,6 +590,8 @@ impl Lw {
             half: z,
             mems,
             heap_mem,
+            root_windows: o.mem_windows & crate::gpu::spirv::ROOT_WINDOWS != 0 && o.mem_windows & crate::gpu::recomp::HEAP_WINDOWS == 0,
+            no_spirv: o.mem_windows & crate::gpu::spirv::NO_SPIRV != 0,
             res,
             fmt_table: None,
             fmt_desc_cache: HashMap::new(),
@@ -662,6 +698,11 @@ impl Lw {
         let stage = self.s.stage;
         let mut dispatch_chain = None;
         let mut spirv = None;
+        let want_spirv = crate::gpu::spirv::wanted() && !self.no_spirv;
+        let static_samplers: Vec<([u32; 4], bool)> = self.static_used.iter().map(|&(w, c, _)| (w, c)).collect();
+        let xspv = (stage == Stage::Compute).then_some((numthreads, hw));
+        // a `spirv::ROOT_WINDOWS` module is only translated to SPIR-V (not valid for D3D12)
+        let spirv_only = |spirv| Ok(Kernel { dxil: Vec::new(), spirv, static_samplers: static_samplers.clone(), dispatch_chain: None, xspv });
         let c = if matches!(stage, Stage::Vertex | Stage::Pixel) {
             let g = self.gfx.take().ok_or("graphics entry without graphics I/O")?;
             let info = if stage == Stage::Pixel { super::graphics::StageInfo::Pixel { early_depth_stencil: false } } else { super::graphics::StageInfo::Vertex };
@@ -671,17 +712,23 @@ impl Lw {
             dispatch_chain = self.s.split_compute(numthreads, split_tid, limit).map(std::sync::Arc::new);
             // the split wave64 form (32-lane waves, e.g. on NVIDIA) without a dispatch chain is
             // one ordinary compute program
-            if dispatch_chain.is_none() && stage == Stage::Compute && crate::gpu::spirv::wanted() {
+            if dispatch_chain.is_none() && stage == Stage::Compute && want_spirv {
                 spirv = Some(crate::gpu::spirv::from_dxil::translate_compute(&self.s.m, numthreads));
             }
+            if self.root_windows {
+                return spirv_only(spirv);
+            }
             self.s.finish_optimized(numthreads, Some(hw))
-        } else if stage == Stage::Compute && crate::gpu::spirv::wanted() {
+        } else if stage == Stage::Compute && want_spirv {
             // the module as `try_finish` leaves it, translated before it is written as DXIL
             if !self.s.m.terminated() {
                 self.s.m.ret();
             }
             self.s.m.optimize();
             spirv = Some(crate::gpu::spirv::from_dxil::translate_compute(&self.s.m, numthreads));
+            if self.root_windows {
+                return spirv_only(spirv);
+            }
             self.s.finish_optimized(numthreads, Some(hw))
         } else {
             self.s.try_finish(numthreads, Some(hw))
@@ -693,28 +740,35 @@ impl Lw {
                 return Err(format!("direct DXIL failed validation: {e}\n--- disassembly ---\n{dis}"));
             }
         }
-        // `XCL_SPIRV=1`: the SPIR-V rides along for the fork's vkd3d-proton build
-        if crate::gpu::spirv::live() {
-            if let Some(Err(e)) = &spirv {
-                crate::gpu::spirv::note_outcome(&format!("none: {e}"));
-            } else if spirv.is_none() {
-                crate::gpu::spirv::note_outcome(if dispatch_chain.is_some() { "none: split into a dispatch chain" } else { "none: not a compute program" });
-            }
+        let k = Kernel { dxil: c, spirv, static_samplers, dispatch_chain, xspv };
+        if self.no_spirv { Ok(k) } else { attach_spirv(k) }
+    }
+}
+
+/// `XCL_SPIRV=1`: the kernel's SPIR-V rides along in an `XSPV` part for the fork's vkd3d-proton
+/// build; without (checked) SPIR-V the program goes the HLSL path (`Err`), unless
+/// `XCL_SPIRV_DIRECT_ALL=1`.
+fn attach_spirv(k: Kernel) -> Result<Kernel, String> {
+    if !crate::gpu::spirv::live() {
+        return Ok(k);
+    }
+    match &k.spirv {
+        Some(Err(e)) => crate::gpu::spirv::note_outcome(&format!("none: {e}")),
+        None => crate::gpu::spirv::note_outcome(if k.dispatch_chain.is_some() { "none: split into a dispatch chain" } else { "none: not a compute program" }),
+        _ => {}
+    }
+    match (&k.spirv, k.xspv) {
+        (Some(Ok(words)), Some((numthreads, hw))) if crate::gpu::spirv::allowed(&k.dxil) => {
+            crate::gpu::spirv::note_outcome("SPIR-V attached");
+            let part = crate::gpu::spirv::xspv_part(numthreads, hw, words);
+            let dxil = super::container::with_part(&k.dxil, *b"XSPV", &part).unwrap_or_else(|| k.dxil.clone());
+            Ok(Kernel { dxil, ..k })
         }
-        let c = match (&spirv, crate::gpu::spirv::live()) {
-            (Some(Ok(words)), true) if crate::gpu::spirv::allowed(&c) => {
-                crate::gpu::spirv::note_outcome("SPIR-V attached");
-                super::container::with_part(&c, *b"XSPV", &crate::gpu::spirv::xspv_part(numthreads, hw, words)).unwrap_or(c)
-            }
-            // the direct DXIL path itself is experimental (GTA VI faults while loading with every
-            // program on it): with `XCL_SPIRV=1` only programs carrying SPIR-V take it, the others
-            // go the HLSL path (`XCL_SPIRV_DIRECT_ALL=1`: all of them as before)
-            _ if crate::gpu::spirv::live() && !crate::gpu::spirv::direct_all() => {
-                return Err("no checked SPIR-V for it (XCL_SPIRV=1 keeps such programs on the HLSL path)".into());
-            }
-            _ => c,
-        };
-        Ok(Kernel { dxil: c, spirv, static_samplers: self.static_used.iter().map(|&(w, c, _)| (w, c)).collect(), dispatch_chain })
+        // the direct DXIL path itself is experimental (GTA VI faults while loading with every
+        // program on it): with `XCL_SPIRV=1` only programs carrying SPIR-V take it, the others
+        // go the HLSL path (`XCL_SPIRV_DIRECT_ALL=1`: all of them as before)
+        _ if !crate::gpu::spirv::direct_all() => Err("no checked SPIR-V for it (XCL_SPIRV=1 keeps such programs on the HLSL path)".into()),
+        _ => Ok(k),
     }
 }
 
@@ -982,8 +1036,8 @@ fn geom_init(lw: &mut Lw, g: &GsInterface, _tid: Value, io: super::shader::RawUa
         }
         let mem = *mem.get_or_insert_with(|| match lw.heap_mem {
             Some(coherent) => {
-                let idx = lw.c(crate::gpu::recomp::MEM_HEAP_BASE);
-                lw.s.heap_raw_buffer_uav(idx, coherent)
+                let w = lw.c(0);
+                lw.window_uav(w, coherent)
             }
             None => lw.mems[0],
         });
